@@ -1,0 +1,1 @@
+pip install xroms xarray netcdf4 dask cartopy ipympl ipykernel
