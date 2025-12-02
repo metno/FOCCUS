@@ -56,7 +56,7 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
     o.set_config('drift:horizontal_diffusivity', horizontal_diffusivity)
     o.set_config('drift:vertical_mixing', vertical_mixing)
     o.set_config('vertical_mixing:diffusivitymodel', 'environment')
-    o.set_config('drift:advection_scheme', 'runge-kutta')
+    o.set_config('drift:advection_scheme', 'runge-kutta4')
 
     if start_time is None:
         start_time = r.start_time
