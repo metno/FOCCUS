@@ -9,24 +9,25 @@ from opendrift.models.oceandrift import OceanDrift
 from datetime import datetime, timedelta
 import os
 
-def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1):
+def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline_shp=None):
     """
         A wrapper for running OpenDrift. https://opendrift.github.io/
     Args:
-        file                    [str]   :   Model netCDF file containing ocean current data.    
-        lon                     [float] :   Initial longitude position.
-        lat                     [float] :   Initial latitude position.
-        z                       [float] :   Initial depth in meters.
-        N                       [int]   :   Number of particles.
-        radius                  [float] :   Particle seeding radius around initial lon and lat. 
-        start_time              [str]   :   Start time following %Y-%m-%dT%H:%M:%S format. 
-        duration                [int]   :   Simulation duration in hours.
-        time_step               [int]   :   Simulation time step in minutes. 
-        time_step_output        [int]   :   Output frequency in minutes.
-        outfile                 [str]   :   Name of output file. 
-        depth_type              [str]   :   Vertical grid type of provided dataset. Currently supports 'z' and 's'. 
-        vertical_mixing         [bool]  :   Set to True to allow particles to propagate vertically. False otherwise. 
-        horizontal_diffusivity  [float] :   Value for horizontal diffusivity. 
+        file                    [str]       :   Model netCDF file containing ocean current data.    
+        lon                     [float]     :   Initial longitude position.
+        lat                     [float]     :   Initial latitude position.
+        z                       [float]     :   Initial depth in meters.
+        N                       [int]       :   Number of particles.
+        radius                  [float]     :   Particle seeding radius around initial lon and lat. 
+        start_time              [str]       :   Start time following %Y-%m-%dT%H:%M:%S format. 
+        duration                [int]       :   Simulation duration in hours.
+        time_step               [int]       :   Simulation time step in minutes. 
+        time_step_output        [int]       :   Output frequency in minutes.
+        outfile                 [str]       :   Name of output file. 
+        depth_type              [str]       :   Vertical grid type of provided dataset. Currently supports 'z' and 's'. 
+        vertical_mixing         [bool]      :   Set to True to allow particles to propagate vertically. False otherwise. 
+        horizontal_diffusivity  [float]     :   Value for horizontal diffusivity. 
+        coastline_shp           [str|list]  :   Add a custom coastline. Defaults to coastline from GSHHG.
     """
     #TODO add more tests for values
     if os.path.isdir(file):
@@ -57,6 +58,16 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
     o.set_config('drift:vertical_mixing', vertical_mixing)
     o.set_config('vertical_mixing:diffusivitymodel', 'environment')
     o.set_config('drift:advection_scheme', 'runge-kutta4')
+
+    if coastline_shp is not None:
+        if isinstance(coastline_shp, str):
+            coastline_shp = [coastline_shp]
+        if isinstance(coastline_shp, list) and all(isinstance(item, str) for item in coastline_shp):
+            raise TypeError('Argument coastline_shp must be either a string or a list of strings.')
+        else:
+            from opendrift.readers import reader_shape
+            for c in coastline_shp:
+                r.append(reader_shape.Reader.from_shpfiles(c))
 
     if start_time is None:
         start_time = r.start_time
