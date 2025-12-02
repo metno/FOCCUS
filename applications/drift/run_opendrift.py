@@ -30,6 +30,11 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
         coastline_shp           [str|list]  :   Add a custom coastline. Defaults to coastline from GSHHG.
     """
     #TODO add more tests for values
+    o = OceanDrift(
+        loglevel=20,
+        seed=0
+    )
+
     if os.path.isdir(file):
         file = file+'/*'
     elif os.path.exists(file) or 'thredds' in file:
@@ -39,17 +44,25 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
         
     if depth_type == 'z':
         from opendrift.readers import reader_netCDF_CF_generic
-        r = reader_netCDF_CF_generic.Reader(file)
+        r = [reader_netCDF_CF_generic.Reader(file)]
     elif depth_type == 's':
         from opendrift.readers import reader_ROMS_native
-        r = reader_ROMS_native.Reader(file)
+        r = [reader_ROMS_native.Reader(file)]
     else:
         raise ValueError(f'Supported depth types are [z, s], got {depth_type}')
 
-    o = OceanDrift(
-        loglevel=20,
-        seed=0
-    )
+    if coastline_shp is not None:
+        if isinstance(coastline_shp, str):
+            coastline_shp = [coastline_shp]
+        if not isinstance(coastline_shp, list) and not all(isinstance(item, str) for item in coastline_shp):
+            raise TypeError('Argument coastline_shp must be either a string or a list of strings.')
+        else:
+            from opendrift.readers import reader_shape
+            for c in coastline_shp:
+                o.set_config("general:use_auto_landmask", False)
+                o.set_config("environment:fallback:land_binary_mask", 0)
+                r.append(reader_shape.Reader.from_shpfiles(c))
+                
     o.add_reader(r)
     
     o.set_config('general:seafloor_action', 'lift_to_seafloor')
@@ -58,16 +71,6 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
     o.set_config('drift:vertical_mixing', vertical_mixing)
     o.set_config('vertical_mixing:diffusivitymodel', 'environment')
     o.set_config('drift:advection_scheme', 'runge-kutta4')
-
-    if coastline_shp is not None:
-        if isinstance(coastline_shp, str):
-            coastline_shp = [coastline_shp]
-        if isinstance(coastline_shp, list) and all(isinstance(item, str) for item in coastline_shp):
-            raise TypeError('Argument coastline_shp must be either a string or a list of strings.')
-        else:
-            from opendrift.readers import reader_shape
-            for c in coastline_shp:
-                r.append(reader_shape.Reader.from_shpfiles(c))
 
     if start_time is None:
         start_time = r.start_time
@@ -98,7 +101,6 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
               'z'
           ]
           )
-    # for some reason it doesn't extract salinity and temp
 
 if __name__ == "__main__":
     #TODO allow a list of lons, lats and z
