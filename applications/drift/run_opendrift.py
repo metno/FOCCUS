@@ -148,6 +148,9 @@ if __name__ == "__main__":
     parser.add_argument(
         '-hd', '--horizontal_diffusivity', default=0.1, type=float, help='Set horizontal diffusivity value.'
     )
+    parser.add_argument(
+        '-c' '--coastline_shp', default=None, help='Provide custom coastline from file(s).'
+    )
     args = parser.parse_args()
     run_opendrift(file=args.file,
                   lon=args.longitude,
@@ -162,5 +165,6 @@ if __name__ == "__main__":
                   outfile=args.outfile,
                   depth_type=args.depth_type,
                   vertical_mixing=args.vertical_mixing,
-                  horizontal_diffusivity=args.horizontal_diffusivity)
+                  horizontal_diffusivity=args.horizontal_diffusivity,
+                  coastline_shp=args.coastline_shp)
 
