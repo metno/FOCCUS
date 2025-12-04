@@ -52,9 +52,9 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
         raise ValueError(f'Supported depth types are [z, s], got {depth_type}')
 
     if coastline is not None:
-        if isinstance(coastline_shp, str):
-            coastline_shp = [coastline_shp]
-        if not isinstance(coastline_shp, list) and not all(isinstance(item, str) for item in coastline_shp):
+        if isinstance(coastline, str):
+            coastline = [coastline]
+        if not isinstance(coastline, list) and not all(isinstance(item, str) for item in coastline):
             raise TypeError('Argument coastline_shp must be either a string or a list of strings.')
         
         o.set_config("general:use_auto_landmask", False)
@@ -65,7 +65,7 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
 
         else: 
             from opendrift.readers import reader_shape
-            for c in coastline_shp:
+            for c in coastline:
                 r.append(reader_shape.Reader.from_shpfiles(c))
         
                 
