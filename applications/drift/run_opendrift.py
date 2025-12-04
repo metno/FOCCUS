@@ -9,7 +9,7 @@ from opendrift.models.oceandrift import OceanDrift
 from datetime import datetime, timedelta
 import os
 
-def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline_shp=None):
+def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline=None):
     """
         A wrapper for running OpenDrift. https://opendrift.github.io/
     Args:
@@ -27,7 +27,7 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
         depth_type              [str]       :   Vertical grid type of provided dataset. Currently supports 'z' and 's'. 
         vertical_mixing         [bool]      :   Set to True to allow particles to propagate vertically. False otherwise. 
         horizontal_diffusivity  [float]     :   Value for horizontal diffusivity. 
-        coastline_shp           [str|list]  :   Add a custom coastline. Defaults to coastline from GSHHG.
+        coastline               [str|list]  :   Add a custom coastline. Defaults to coastline from GSHHG. If set to "Model" will use model landmask. 
     """
     #TODO add more tests for values
     o = OceanDrift(
@@ -51,17 +51,23 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
     else:
         raise ValueError(f'Supported depth types are [z, s], got {depth_type}')
 
-    if coastline_shp is not None:
+    if coastline is not None:
         if isinstance(coastline_shp, str):
             coastline_shp = [coastline_shp]
         if not isinstance(coastline_shp, list) and not all(isinstance(item, str) for item in coastline_shp):
             raise TypeError('Argument coastline_shp must be either a string or a list of strings.')
-        else:
+        
+        o.set_config("general:use_auto_landmask", False)
+        o.set_config("environment:fallback:land_binary_mask", 0)
+            
+        if coastline[0] == 'Model':
+            pass
+
+        else: 
             from opendrift.readers import reader_shape
             for c in coastline_shp:
-                o.set_config("general:use_auto_landmask", False)
-                o.set_config("environment:fallback:land_binary_mask", 0)
                 r.append(reader_shape.Reader.from_shpfiles(c))
+        
                 
     o.add_reader(r)
     
@@ -151,7 +157,7 @@ if __name__ == "__main__":
         '-hd', '--horizontal_diffusivity', default=0.1, type=float, help='Set horizontal diffusivity value.'
     )
     parser.add_argument(
-        '-c' '--coastline_shp', default=None, help='Provide custom coastline from file(s).'
+        '-c' '--coastline', default=None, help='Provide custom coastline from file(s).'
     )
     args = parser.parse_args()
     run_opendrift(file=args.file,
@@ -168,5 +174,5 @@ if __name__ == "__main__":
                   depth_type=args.depth_type,
                   vertical_mixing=args.vertical_mixing,
                   horizontal_diffusivity=args.horizontal_diffusivity,
-                  coastline_shp=args.coastline_shp)
+                  coastline=args.coastline)
 
