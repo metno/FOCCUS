@@ -9,7 +9,7 @@ from opendrift.models.oceandrift import OceanDrift
 from datetime import datetime, timedelta
 import os
 
-def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline=None):
+def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline=None, track_vars=None):
     """
         A wrapper for running OpenDrift. https://opendrift.github.io/
     Args:
@@ -28,8 +28,24 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
         vertical_mixing         [bool]      :   Set to True to allow particles to propagate vertically. False otherwise. 
         horizontal_diffusivity  [float]     :   Value for horizontal diffusivity. 
         coastline               [str|list]  :   Add a custom coastline. Defaults to coastline from GSHHG. If set to "Model" will use model landmask. 
+        track_vars              [str|list]  :   Keep track of additional variables along particle trajectory. NOTE: this variable naming is very strict and predefined in OpenDrift code. See OpenDrift.readers for permitted variables and names. E.g. https://github.com/OpenDrift/opendrift/blob/master/opendrift/readers/reader_ROMS_native.py
     """
     #TODO add more tests for values
+    if track_vars is not None:
+        if isinstance(track_vars, str):
+            track_vars = [track_vars]
+        if not isinstance(track_vars, list) and not all(isinstance(item, str) for item in track_vars):
+            raise TypeError('Argument track_vars must be either a string or a list of strings.')
+        
+        else:
+            import numpy as np
+            for var in track_vars:
+                OceanDrift.required_variables.update(
+                    {
+                        var: {'fallback': np.nan} 
+                    }
+                )
+    
     o = OceanDrift(
         loglevel=20,
         seed=0
@@ -55,7 +71,7 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
         if isinstance(coastline, str):
             coastline = [coastline]
         if not isinstance(coastline, list) and not all(isinstance(item, str) for item in coastline):
-            raise TypeError('Argument coastline_shp must be either a string or a list of strings.')
+            raise TypeError('Argument coastline must be either a string or a list of strings.')
         
         o.set_config("general:use_auto_landmask", False)
         o.set_config("environment:fallback:land_binary_mask", 0)
@@ -100,12 +116,7 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
     o.run(duration=timedelta(hours=duration),
           time_step=timedelta(minutes=time_step),
           time_step_output=timedelta(minutes=time_step_output),
-          outfile=outfile,
-          export_variables=[
-              'sea_water_temperature',
-              'sea_water_salinity',
-              'z'
-          ]
+          outfile=outfile
           )
 
 if __name__ == "__main__":
@@ -159,6 +170,9 @@ if __name__ == "__main__":
     parser.add_argument(
         '-c' '--coastline', default=None, help='Provide custom coastline from file(s).'
     )
+    parser.add_argument(
+        '-tv' '--track_vars', default=None, help='Additional variables to output along particle trajectory.'
+    )
     args = parser.parse_args()
     run_opendrift(file=args.file,
                   lon=args.longitude,
@@ -174,5 +188,6 @@ if __name__ == "__main__":
                   depth_type=args.depth_type,
                   vertical_mixing=args.vertical_mixing,
                   horizontal_diffusivity=args.horizontal_diffusivity,
-                  coastline=args.coastline)
+                  coastline=args.coastline,
+                  track_vars=args.track_vars)
 
