@@ -95,24 +95,28 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
     o.set_config('drift:advection_scheme', 'runge-kutta4')
 
     if start_time is None:
-        start_time = r.start_time
+        start_time = [r.start_time]
     elif type(start_time) == str:
         try:
-            start_time = datetime.strptime(start_time, '%Y-%m-%dT%H:%M:%S')
+            start_time = [datetime.strptime(start_time, '%Y-%m-%dT%H:%M:%S')]
         except:
             raise ValueError('Provided start time does not follow required format. Try %Y-%m-%dT%H:%M:%S')
-    elif type(start_time) == datetime.datetime:
-        pass
+    elif (isinstance(start_time, list) and all(isinstance(item, datetime) for item in start_time) 
+        or isinstance(start_time, np.ndarray) and all(isinstance(item, datetime) for item in start_time)):
+        start_time=start_time
+    elif isinstance(start_time, datetime):
+        start_time=[start_time]
     else:
         raise TypeError('Type of start_time is not supported.')
     
-    o.seed_elements(lon=lon,
-                    lat=lat,
-                    z=z,
-                    number=N,
-                    radius=radius,
-                    time=start_time)
-    
+    for t in start_time:
+        o.seed_elements(lon=lon,
+                        lat=lat,
+                        z=z,
+                        number=N,
+                        radius=radius,
+                        time=t)
+        
     o.run(duration=timedelta(hours=duration),
           time_step=timedelta(minutes=time_step),
           time_step_output=timedelta(minutes=time_step_output),
