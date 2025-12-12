@@ -9,7 +9,7 @@ from opendrift.models.oceandrift import OceanDrift
 from datetime import datetime, timedelta
 import os
 
-def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline=None, track_vars=None):
+def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline=None, track_vars=None, density_map=False):
     """
         A wrapper for running OpenDrift. https://opendrift.github.io/
     Args:
@@ -29,6 +29,7 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
         horizontal_diffusivity  [float]     :   Value for horizontal diffusivity. 
         coastline               [str|list]  :   Add a custom coastline. Defaults to coastline from GSHHG. If set to "Model" will use model landmask. 
         track_vars              [str|list]  :   Keep track of additional variables along particle trajectory. NOTE: this variable naming is very strict and predefined in OpenDrift code. See OpenDrift.readers for permitted variables and names. E.g. https://github.com/OpenDrift/opendrift/blob/master/opendrift/readers/reader_ROMS_native.py
+        density_map             [bool]      :   Output density map of particles.
     """
     #TODO add more tests for values
     if track_vars is not None:
@@ -123,6 +124,11 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
           outfile=outfile
           )
 
+    if isinstance(density_map, bool) and density_map is True:
+        import pyproj
+        o.write_netcdf_density_map_proj(outfile, density_proj=pyproj.Proj('+proj=stere +lat_0=90 +lat_ts=60 +lon_0=70 +x_0=3369600 +y_0=1844800 +a=6378137 +b=6356752.3142 +units=m +no_defs +type=crs'))
+
+
 if __name__ == "__main__":
     #TODO allow a list of lons, lats and z
     import argparse
@@ -177,6 +183,9 @@ if __name__ == "__main__":
     parser.add_argument(
         '-tv' '--track_vars', default=None, help='Additional variables to output along particle trajectory.'
     )
+    parser.add_argument(
+        '-dm' '--density_map', type=bool, default=False, help='Output density map of particles.'
+    )
     args = parser.parse_args()
     run_opendrift(file=args.file,
                   lon=args.longitude,
@@ -193,5 +202,6 @@ if __name__ == "__main__":
                   vertical_mixing=args.vertical_mixing,
                   horizontal_diffusivity=args.horizontal_diffusivity,
                   coastline=args.coastline,
-                  track_vars=args.track_vars)
+                  track_vars=args.track_vars,
+                  density_map=args.density_map)
 
