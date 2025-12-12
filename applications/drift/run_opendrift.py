@@ -9,7 +9,7 @@ from opendrift.models.oceandrift import OceanDrift
 from datetime import datetime, timedelta
 import os
 
-def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline=None, track_vars=None, density_map=False):
+def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline=None, track_vars=None, density_grid=None):
     """
         A wrapper for running OpenDrift. https://opendrift.github.io/
     Args:
@@ -29,7 +29,7 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
         horizontal_diffusivity  [float]     :   Value for horizontal diffusivity. 
         coastline               [str|list]  :   Add a custom coastline. Defaults to coastline from GSHHG. If set to "Model" will use model landmask. 
         track_vars              [str|list]  :   Keep track of additional variables along particle trajectory. NOTE: this variable naming is very strict and predefined in OpenDrift code. See OpenDrift.readers for permitted variables and names. E.g. https://github.com/OpenDrift/opendrift/blob/master/opendrift/readers/reader_ROMS_native.py
-        density_map             [bool]      :   Output density map of particles.
+        density_grid            [int]       :   Create a density map of particles. This arg specifies grid size for map. 
     """
     #TODO add more tests for values
     if track_vars is not None:
@@ -124,10 +124,22 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
           outfile=outfile
           )
 
-    if isinstance(density_map, bool) and density_map is True:
-        import pyproj
-        o.write_netcdf_density_map_proj(outfile, density_proj=pyproj.Proj('+proj=stere +lat_0=90 +lat_ts=60 +lon_0=70 +x_0=3369600 +y_0=1844800 +a=6378137 +b=6356752.3142 +units=m +no_defs +type=crs'))
-
+    if density_grid is not None and isinstance(density_grid, int):
+        import trajan
+        import xarray as xr
+        ds = xr.open_dataset(outfile)
+        grid = ds.traj.make_grid(dx=500)
+        ds_c = ds.traj.concentration(grid)
+        ds = ds.assign_coords({
+        "c_lon": ds_c.lon.values, 
+        "c_lat": ds_c.lat.values
+        })
+        ds = ds.assign({
+            "number": (['time', 'c_lat', 'c_lon'], ds_c.number.values),
+            "cell_area": (['c_lat', 'c_lon'], ds_c.cell_area.values),
+            "number_area_concentration": (['time', 'c_lat', 'c_lon'], ds_c.number_area_concentration.values),
+        })
+        ds.to_netcdf(outfile)
 
 if __name__ == "__main__":
     #TODO allow a list of lons, lats and z
@@ -184,7 +196,7 @@ if __name__ == "__main__":
         '-tv' '--track_vars', default=None, help='Additional variables to output along particle trajectory.'
     )
     parser.add_argument(
-        '-dm' '--density_map', type=bool, default=False, help='Output density map of particles.'
+        '-dg' '--density_grid', type=int, help='Create a density map of particles. This arg specifies grid size for map.'
     )
     args = parser.parse_args()
     run_opendrift(file=args.file,
@@ -203,5 +215,5 @@ if __name__ == "__main__":
                   horizontal_diffusivity=args.horizontal_diffusivity,
                   coastline=args.coastline,
                   track_vars=args.track_vars,
-                  density_map=args.density_map)
+                  density_grid=args.density_grid)
 
