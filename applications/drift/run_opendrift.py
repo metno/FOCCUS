@@ -128,7 +128,8 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
         import trajan
         import xarray as xr
         ds = xr.open_dataset(outfile)
-        grid = ds.traj.make_grid(dx=500)
+        os.system(f'rm {outfile}')
+        grid = ds.traj.make_grid(dx=density_grid)
         ds_c = ds.traj.concentration(grid)
         ds = ds.assign_coords({
         "c_lon": ds_c.lon.values, 
