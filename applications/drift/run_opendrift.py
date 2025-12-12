@@ -9,7 +9,7 @@ from opendrift.models.oceandrift import OceanDrift
 from datetime import datetime, timedelta
 import os
 
-def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0.1, coastline=None, track_vars=None, density_grid=None):
+def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=12, time_step=30, time_step_output=60, outfile='sample_file.nc', depth_type='z', vertical_mixing=False, horizontal_diffusivity=0, coastline=None, track_vars=None, density_grid=None):
     """
         A wrapper for running OpenDrift. https://opendrift.github.io/
     Args:
@@ -193,7 +193,7 @@ if __name__ == "__main__":
         '-vm', '--vertical_mixing', default=False, action=argparse.BooleanOptionalAction, help='When used, will turn on vertical mixing.'
     )
     parser.add_argument(
-        '-hd', '--horizontal_diffusivity', default=0.1, type=float, help='Set horizontal diffusivity value.'
+        '-hd', '--horizontal_diffusivity', default=0, type=float, help='Set horizontal diffusivity value.'
     )
     parser.add_argument(
         '-c' '--coastline', default=None, help='Provide custom coastline from file(s).'
