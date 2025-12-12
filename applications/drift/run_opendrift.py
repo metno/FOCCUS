@@ -13,23 +13,23 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
     """
         A wrapper for running OpenDrift. https://opendrift.github.io/
     Args:
-        file                    [str]       :   Model netCDF file containing ocean current data.    
-        lon                     [float]     :   Initial longitude position.
-        lat                     [float]     :   Initial latitude position.
-        z                       [float]     :   Initial depth in meters.
-        N                       [int]       :   Number of particles.
-        radius                  [float]     :   Particle seeding radius around initial lon and lat. 
-        start_time              [str]       :   Start time following %Y-%m-%dT%H:%M:%S format. 
-        duration                [int]       :   Simulation duration in hours.
-        time_step               [int]       :   Simulation time step in minutes. 
-        time_step_output        [int]       :   Output frequency in minutes.
-        outfile                 [str]       :   Name of output file. 
-        depth_type              [str]       :   Vertical grid type of provided dataset. Currently supports 'z' and 's'. 
-        vertical_mixing         [bool]      :   Set to True to allow particles to propagate vertically. False otherwise. 
-        horizontal_diffusivity  [float]     :   Value for horizontal diffusivity. 
-        coastline               [str|list]  :   Add a custom coastline. Defaults to coastline from GSHHG. If set to "Model" will use model landmask. 
-        track_vars              [str|list]  :   Keep track of additional variables along particle trajectory. NOTE: this variable naming is very strict and predefined in OpenDrift code. See OpenDrift.readers for permitted variables and names. E.g. https://github.com/OpenDrift/opendrift/blob/master/opendrift/readers/reader_ROMS_native.py
-        density_grid            [int]       :   Create a density map of particles. This arg specifies grid size for map. 
+        file                    [str]               :   Model netCDF file containing ocean current data.    
+        lon                     [float]             :   Initial longitude position.
+        lat                     [float]             :   Initial latitude position.
+        z                       [float|int|list]    :   Initial depth in meters.
+        N                       [int]               :   Number of particles. Scales lineary with number of seeding depths. 
+        radius                  [float]             :   Particle seeding radius around initial lon and lat. 
+        start_time              [str]               :   Start time following %Y-%m-%dT%H:%M:%S format. 
+        duration                [int]               :   Simulation duration in hours.
+        time_step               [int]               :   Simulation time step in minutes. 
+        time_step_output        [int]               :   Output frequency in minutes.
+        outfile                 [str]               :   Name of output file. 
+        depth_type              [str]               :   Vertical grid type of provided dataset. Currently supports 'z' and 's'. 
+        vertical_mixing         [bool]              :   Set to True to allow particles to propagate vertically. False otherwise. 
+        horizontal_diffusivity  [float]             :   Value for horizontal diffusivity. 
+        coastline               [str|list]          :   Add a custom coastline. Defaults to coastline from GSHHG. If set to "Model" will use model landmask. 
+        track_vars              [str|list]          :   Keep track of additional variables along particle trajectory. NOTE: this variable naming is very strict and predefined in OpenDrift code. See OpenDrift.readers for permitted variables and names. E.g. https://github.com/OpenDrift/opendrift/blob/master/opendrift/readers/reader_ROMS_native.py
+        density_grid            [int]               :   Create a density map of particles. This arg specifies grid size for map. 
     """
     #TODO add more tests for values
     if track_vars is not None:
@@ -97,7 +97,7 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
 
     if start_time is None:
         start_time = [r.start_time]
-    elif type(start_time) == str:
+    elif isinstance(start_time, str):
         try:
             start_time = [datetime.strptime(start_time, '%Y-%m-%dT%H:%M:%S')]
         except:
@@ -110,11 +110,16 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
     else:
         raise TypeError('Type of start_time is not supported.')
     
+    if isinstance(z, float) or isinstance(z, int):
+        z = [z]
+    elif isinstance(z, np.ndarray):
+        z = list(z)
+    
     for t in start_time:
         o.seed_elements(lon=lon,
                         lat=lat,
-                        z=z,
-                        number=N,
+                        z=z*N,
+                        number=N*len(z),
                         radius=radius,
                         time=t)
         
