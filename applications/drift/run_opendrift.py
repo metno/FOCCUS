@@ -43,12 +43,12 @@ def run_opendrift(file, lon, lat, z=0, N=1, radius=0, start_time=None, duration=
             for var in track_vars:
                 OceanDrift.required_variables.update(
                     {
-                        var: {'fallback': np.nan} 
+                        var: {'fallback': -999} 
                     }
                 )
     
     o = OceanDrift(
-        loglevel=20,
+        loglevel=30,
         seed=0
     )
 
