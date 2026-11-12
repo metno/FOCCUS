@@ -15,7 +15,7 @@ import numpy as np
 o = ChemicalDrift(loglevel=0, seed=0)
 
 # Norkyst
-reader_norkyst = reader_netCDF_CF_generic.Reader('https://thredds.met.no/thredds/dodsC/sea/norkyst800m/1h/aggregate_be')
+reader_norkyst = reader_netCDF_CF_generic.Reader('https://thredds.met.no/thredds/dodsC/fou-hi/norkystv3_800m_m00_be')
 mixed_layer = ConstantReader({'ocean_mixed_layer_thickness': 40})
 o.add_reader([reader_norkyst,mixed_layer])
 
@@ -71,13 +71,9 @@ print('Number of transformations:')
 for isp in range(o.nspecies):
     print('{}'.format(['{:>9}'.format(np.int32(item)) for item in o.ntransformations[isp,:]]) )
 
-mass = o.get_property('mass')
-mass_d = o.get_property('mass_degraded')
-mass_v = o.get_property('mass_volatilized')
-
-m_pre = sum(mass[0][-1])
-m_deg = sum(mass_d[0][-1])
-m_vol = sum(mass_v[0][-1])
+m_pre = o.result.mass.isel(time=-1).sum()
+m_deg = o.result.mass_degraded.isel(time=-1).sum()
+m_vol = o.result.mass_volatilized.isel(time=-1).sum()
 m_tot = m_pre + m_deg + m_vol
 
 print('Mass budget for target chemical:')

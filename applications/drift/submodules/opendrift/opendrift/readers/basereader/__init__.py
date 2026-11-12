@@ -28,9 +28,6 @@ from matplotlib.patches import Polygon
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-from .structured import StructuredReader
-from .unstructured import UnstructuredReader
-from .continuous import ContinuousReader
 from .variables import Variables
 from .consts import *
 from ..operators.ops import Combine, Filter
@@ -118,6 +115,8 @@ class BaseReader(Variables, Combine, Filter):
 
         self.is_lazy = False  # Generally False
 
+        self._element_ID = None  # Generally readers should not know ID of elements
+
         # Set projection for coordinate transformations
         if self.proj is None:
             if self.proj4 is not None:
@@ -188,7 +187,10 @@ class BaseReader(Variables, Combine, Filter):
             self.activate_environment_mapping(m)
 
     def y_is_north(self):
-        if (self.proj.crs.is_geographic and 'ob_tran' not in self.proj4) or '+proj=merc' in self.proj.srs:
+        if self.proj is None and self.proj4 is not None:
+            if '+proj=merc' in self.proj4 or '+proj=latlon' in self.proj4:
+                return True
+        elif (self.proj.crs.is_geographic and 'ob_tran' not in self.proj4) or '+proj=merc' in self.proj.srs:
             return True
         else:
             return False
@@ -261,8 +263,8 @@ class BaseReader(Variables, Combine, Filter):
             x0 = (self.xmin + self.xmax) / 2
             y0 = (self.ymin + self.ymax) / 2
             lon0, lat0 = self.xy2lonlat(x0, y0)
-            lon0 = lon0[0]
-            lat0 = lat0[0]
+            lon0 = np.squeeze(lon0).item()
+            lat0 = np.squeeze(lat0).item()
             sp = ccrs.Stereographic(central_longitude=lon0, central_latitude=lat0)
             latmax = np.maximum(latmax, lat0)
             latmin = np.minimum(latmin, lat0)
@@ -274,21 +276,20 @@ class BaseReader(Variables, Combine, Filter):
 
         if lscale == 'auto':  # Custom lscale - this should be generalized to Basemodel also
             s = cfeature.AdaptiveScaler('coarse',
-                (('low', 100), ('intermediate', 20), ('high', 5), ('full', 1)))
+                (('low', 100), ('intermediate', 20), ('high', 1), ('full', .2)))
             lscale = s.scale_from_extent([lonmin, lonmax, latmin, latmax])
 
         # GSHHS coastlines
         f = cfeature.GSHHSFeature(scale=lscale, levels=[1,5,6])
         f._geometries_cache = {}
         ax.add_geometries(
-            #f.intersecting_geometries([lonmin, lonmax, latmin, latmax]),
-            f.geometries(),
+            f.intersecting_geometries([lonmin, lonmax, latmin, latmax]),
+            #f.geometries(),
             ccrs.PlateCarree(),
             facecolor=cfeature.COLORS['land'],
             edgecolor='black')
 
-        gl = ax.gridlines(ccrs.PlateCarree())
-        gl.top_labels = False
+        gl = ax.gridlines(ccrs.PlateCarree(), draw_labels=['left', 'bottom'], x_inline=False, y_inline=False)
 
         # Get boundary
         if self.global_coverage():
@@ -318,11 +319,12 @@ class BaseReader(Variables, Combine, Filter):
             boundary = Polygon(list(zip(xsp, ysp)), alpha=0.5, ec='k', fc='b',
                                zorder=100)
             ax.add_patch(boundary)
-            if self.global_coverage():
-                ax.set_global()
-            else:
-                buf = (xsp.max()-xsp.min())*.1  # Some whitespace around polygon
-                ax.set_extent([xsp.min()-buf, xsp.max()+buf, ysp.min()-buf, ysp.max()+buf], crs=sp)
+        if self.global_coverage():
+            ax.set_global()
+        else:
+            #buf = (xsp.max()-xsp.min())*.1  # Some whitespace around polygon
+            buf = 111000 * buffer  # degrees to meters
+            ax.set_extent([xsp.min()-buf, xsp.max()+buf, ysp.min()-buf, ysp.max()+buf], crs=sp)
         if title is None:
             plt.title(self.name)
         else:
@@ -333,8 +335,14 @@ class BaseReader(Variables, Combine, Filter):
         if time is None:
             time = self.start_time
         if variable is not None:
-            rx = np.array([self.xmin, self.xmax])
-            ry = np.array([self.ymin, self.ymax])
+            if self.global_coverage():
+                ax.set_global()
+                # Spaced by 500 to avoid splitting in west/east blocks
+                rx = np.linspace(self.xmin, self.xmax, num=int(np.ceil(self.numx/500))+1)
+                ry = np.linspace(self.ymin, self.ymax, num=len(rx))
+            else:
+                rx = np.array([self.xmin, self.xmax])
+                ry = np.array([self.ymin, self.ymax])
             if variable in self.derived_variables:
                 data = self.get_variables(self.derived_variables[variable], time, rx, ry)
                 self.__calculate_derived_environment_variables__(data)
@@ -356,7 +364,7 @@ class BaseReader(Variables, Combine, Filter):
                 p = sp.transform_points(ccrs.PlateCarree(), rlon, rlat)
                 mapx = p[:,:,0]
                 mapy = p[:,:,1]
-                mappable = ax.pcolormesh(mapx, mapy, data[variable], vmin=vmin, vmax=vmax,  cmap = cmap)
+                mappable = ax.pcolormesh(mapx, mapy, data[variable], vmin=vmin, vmax=vmax,  cmap=cmap)
 
             cbar = fig.colorbar(mappable, orientation='horizontal', pad=.05, aspect=30, shrink=.4)
             if cbar_label:

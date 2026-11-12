@@ -14,10 +14,10 @@
 #
 # Copyright 2020, Knut-Frode Dagestad, MET Norway
 
-from opendrift.readers.basereader import BaseReader, ContinuousReader
+from opendrift.readers.basereader.continuous import ContinuousReader
 import numpy as np
 
-class Reader(BaseReader, ContinuousReader):
+class Reader(ContinuousReader):
     '''Reader providing the nearest value in time from a given time series.'''
 
     def __init__(self, parameter_value_map):
@@ -27,8 +27,8 @@ class Reader(BaseReader, ContinuousReader):
         '''
 
         self.times = parameter_value_map['time']
-        if type(self.times) is not list:
-            raise ValueError('time must be a list of datetime objects')
+        if not hasattr(self.times, '__len__'):
+            raise ValueError('time must be an array of datetime objects')
         del parameter_value_map['time']
 
         for key, var in parameter_value_map.items():

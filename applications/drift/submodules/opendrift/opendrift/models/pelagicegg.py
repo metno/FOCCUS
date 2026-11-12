@@ -17,6 +17,7 @@
 import numpy as np
 import logging; logger = logging.getLogger(__name__)
 
+from opendrift.models.physics_methods import seawater_dynamic_viscosity
 from opendrift.models.oceandrift import OceanDrift, Lagrangian3DArray
 from opendrift.config import CONFIG_LEVEL_ESSENTIAL, CONFIG_LEVEL_BASIC, CONFIG_LEVEL_ADVANCED
 
@@ -89,10 +90,12 @@ class PelagicEggDrift(OceanDrift):
         super(PelagicEggDrift, self).__init__(*args, **kwargs)
 
         # By default, eggs do not strand towards coastline
-        self.set_config('general:coastline_action', 'previous')
+        self._set_config_default('general:coastline_action', 'previous')
 
-        # Vertical mixing is enabled by default
-        self.set_config('drift:vertical_mixing', True)
+        # Vertical mixing is enabled by default, also at surface. Also vertical advection at surface.
+        self._set_config_default('drift:vertical_mixing', True)
+        self._set_config_default('drift:vertical_mixing_at_surface', True)
+        self._set_config_default('drift:vertical_advection_at_surface', True)
 
     def update_terminal_velocity(self, Tprofiles=None,
                                  Sprofiles=None, z_index=None):
@@ -153,7 +156,7 @@ class PelagicEggDrift(OceanDrift):
         dr = DENSw-DENSegg  # density difference
 
         # water viscosity
-        my_w = 0.001*(1.7915 - 0.0538*T0 + 0.007*(T0**(2.0)) - 0.0023*S0)
+        my_w = seawater_dynamic_viscosity(T0, S0)
         # ~0.0014 kg m-1 s-1
 
         # terminal velocity for low Reynolds numbers

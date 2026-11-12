@@ -11,6 +11,7 @@ from opendrift.readers import reader_timeseries
 from opendrift.readers.operators import ops
 import opendrift.models.physics_methods as phy
 import xarray as xr
+import trajan as _
 import numpy as np
 import pyproj
 import matplotlib.pyplot as plt
@@ -30,7 +31,7 @@ mpl.rcParams['mathtext.fontset'] = "dejavusans"
 
 #%%
 # This example shows how to use wind or currents measurments 
-# combined with an ocean model to improove the drift
+# combined with an ocean model to improve the drift
 # calculation arround the measurment station.
 
 
@@ -161,10 +162,9 @@ o2.run(end_time=time_end, time_step=time_step, time_step_output=time_step_output
 
 o.plot(fast = False, compare=o2, background=['x_sea_water_velocity', 'y_sea_water_velocity'], legend=['Norkyst only', 'Gaussian measurement'], buffer = .023, markersize = 70, linewidth = 1, title = "", xlocs = mpl.ticker.MaxNLocator(5), ylocs = mpl.ticker.MaxNLocator(5), clabel = r"Wind speed $\mathrm{(m.s^{-1})}$", cpad = 0.08, text=text)
 
-lon_drifters_1, lat_drifters_1 = o.get_lonlats()
-lon_drifters_2, lat_drifters_2 = o2.get_lonlats()
-
-skillscores = phy.skillscore_liu_weissberg(lon_drifters_1, lat_drifters_1, lon_drifters_2, lat_drifters_2)
+#%%
+# Calculating skillscores with TrajAn
+skillscores = o.result.traj.skill(o2.result, method='liu-weissberg', tolerance_threshold=1)
 
 plt.figure()
 plt.hist(skillscores, bins = 100, range = (0, 1), facecolor = 'none', edgecolor = 'C0')

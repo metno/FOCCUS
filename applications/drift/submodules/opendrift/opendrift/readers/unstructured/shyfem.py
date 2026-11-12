@@ -20,10 +20,10 @@ from netCDF4 import Dataset, MFDataset
 import logging
 logger = logging.getLogger(__name__)
 
-from opendrift.readers.basereader import BaseReader, UnstructuredReader
+from opendrift.readers.basereader.unstructured import UnstructuredReader
 
 
-class Reader(BaseReader, UnstructuredReader):
+class Reader(UnstructuredReader):
     """
     A reader for unstructured SHYFEM (irregularily gridded) `CF compliant
     <https://cfconventions.org/>`_ netCDF files.
@@ -199,6 +199,16 @@ class Reader(BaseReader, UnstructuredReader):
                 variables[var] = block[
                         nodes - nodes.min(),
                         level_ind - level_ind.min(),
+                        ]
+            elif len(dvar.shape) == 2:
+                # Reading the smallest block covering the actual data
+                block = dvar[indx_nearest,
+                             slice(nodes.min(),
+                                   nodes.max() + 1), ]
+
+                # Picking the nearest value
+                variables[var] = block[
+                        nodes - nodes.min(),
                         ]
             elif len(dvar.shape) == 1:
                 # Reading the smallest block covering the actual data

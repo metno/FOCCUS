@@ -44,7 +44,7 @@ class TestXarray(unittest.TestCase):
                         amplitude=1, zero_time=t2)
         o.add_reader([reader_x, reader_y])
         o.set_config('environment:fallback:land_binary_mask', 0)
-        o.set_config('drift:horizontal_diffusivity', 10)
+        o.set_config('environment:constant:horizontal_diffusivity', 10)
         o.seed_elements(time=t1, lon=4, lat=60, number=100,
                         origin_marker=0)
         o.seed_elements(time=[t1, t2], lon=4.2, lat=60.2, number=100,
@@ -56,8 +56,7 @@ class TestXarray(unittest.TestCase):
         density_pixelsize_m=5000
         H, Hsub, Hsurf, lon_array, lat_array = o.get_density_array(pixelsize_m=density_pixelsize_m)
 
-        ox = opendrift.open_xarray(outfile)
-        Hx = ox.get_histogram(pixelsize_m=density_pixelsize_m)
+        Hx = o.get_histogram(pixelsize_m=density_pixelsize_m)
         self.assertAlmostEqual(lon_array[0], 3.94, 1)
         self.assertAlmostEqual(lon_array[-1], 4.76, 1)
         self.assertAlmostEqual(Hx.lon_bin[0].values, 3.90, 1)

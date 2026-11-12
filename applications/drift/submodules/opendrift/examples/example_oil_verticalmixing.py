@@ -19,7 +19,7 @@ if import_file is True:
     o.io_import_file(ncfile)
 else:
     reader_arome = reader_netCDF_CF_generic.Reader('https://thredds.met.no/thredds/dodsC/mepslatest/meps_lagged_6_h_latest_2_5km_latest.nc')
-    reader_norkyst = reader_netCDF_CF_generic.Reader('https://thredds.met.no/thredds/dodsC/sea/norkyst800m/1h/aggregate_be')
+    reader_norkyst = reader_netCDF_CF_generic.Reader('https://thredds.met.no/thredds/dodsC/fou-hi/norkystv3_800m_m00_be')
 
     o.add_reader([reader_norkyst, reader_arome])
 
@@ -27,8 +27,8 @@ else:
     #o.set_config('vertical_mixing:diffusivitymodel', 'windspeed_Sundby1983')
 
     # Seed oil elements at defined position and time
-    o.seed_elements(lon=4.9, lat=62.1, z=0, radius=1000, number=2000,
-                    time=reader_arome.start_time)
+    o.seed_elements(lon=4.9, lat=62.1, z=0, radius=1000, number=5000,
+                    time=reader_arome.start_time, oil_type='GENERIC DIESEL')
 
     # Running model
     o.run(end_time=reader_arome.start_time + timedelta(hours=12),

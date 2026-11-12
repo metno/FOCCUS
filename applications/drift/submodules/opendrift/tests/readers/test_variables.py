@@ -2,6 +2,7 @@ import numpy as np
 import pyproj
 from . import *
 from datetime import datetime, timedelta
+from opendrift import test_data_folder as tdf
 from opendrift.readers import reader_netCDF_CF_generic
 from opendrift.readers import reader_constant
 from opendrift.models.physics_methods import wind_drift_factor_from_trajectory
@@ -11,9 +12,9 @@ from opendrift.readers.basereader.variables import ReaderDomain
 
 def test_get_variables_along_trajectory_and_wind_drift_factor_from_trajectory():
     o = OceanDrift(loglevel=50)
-    o.add_readers_from_list([o.test_data_folder() +
+    o.add_readers_from_list([tdf +
         '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc',
-        o.test_data_folder() +
+        tdf +
         '16Nov2015_NorKyst_z_surface/arome_subset_16Nov2015.nc'], lazy=False)
 
     o.env.finalize()
@@ -24,8 +25,8 @@ def test_get_variables_along_trajectory_and_wind_drift_factor_from_trajectory():
     np.testing.assert_array_almost_equal(t['x_wind'], [-8.308249, -13.063459, -11.09289])
 
     wdf, azimuth = wind_drift_factor_from_trajectory(t)
-    np.testing.assert_array_almost_equal(wdf, [0.27189012, 0.20492421])
-    np.testing.assert_array_almost_equal(azimuth, [73.0112213, 82.39749185])
+    np.testing.assert_array_almost_equal(wdf, [0.27189012, 0.20492421], 5)
+    np.testing.assert_array_almost_equal(azimuth, [73.0112213, 82.39749185], 5)
 
 def test_modulate_longitude_360():
     class R360(ReaderDomain):
@@ -127,9 +128,22 @@ def test_environment_mapping(test_data):
     np.testing.assert_almost_equal(o.elements.lat, 60.034, 3)
 
     # land_binary_mask mapped from sea_floor_depth_below_sea_level
-    r = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+    r = reader_netCDF_CF_generic.Reader(tdf +
             '14Jan2016_NorKyst_z_3d/NorKyst-800m_ZDEPTHS_his_00_3Dsubset.nc')
     assert 'land_binary_mask' not in r.derived_variables  # Disabled by default
     r.activate_environment_mapping('land_binary_mask_from_ocean_depth')
     assert 'land_binary_mask' in r.derived_variables
 
+def test_lonlat_bounds_lcc(test_data_fake_ig):
+    """
+    Test the lonlat_bounds method for data in lcc projection
+    """
+    bbox = test_data_fake_ig.lonlat_bounds()
+    assert np.isclose(bbox, [-109.8, 55.7, 37.8, 86.1], rtol=0.2).all()
+
+def test_lonlat_bounds_ob_tran(test_data_fake_wind_ob_tran):
+    """
+    Test the lonlat_bounds method for data in ob_tran projection (rotated pole)
+    """
+    bbox = test_data_fake_wind_ob_tran.lonlat_bounds()
+    assert np.isclose(bbox, [-28.62, 44.38, 37.01, 72.88], rtol=0.1).all()

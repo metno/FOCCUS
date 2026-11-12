@@ -16,10 +16,11 @@ def test_seed():
     o.add_reader([fake_eddy])
     o.set_config('environment:constant:x_wind', 0)
     o.set_config('environment:constant:y_wind', 0)
-    o.seed_elements(lon=4, lat=60, number=100, time=fake_eddy.start_time)
+    o.seed_elements(lon=4, lat=60, number=100, time=fake_eddy.start_time, mass_oil=4)
     assert len(o.elements) == 0
     assert len(o.elements_deactivated) == 0
     assert len(o.elements_scheduled) == 100
+    assert o.elements_scheduled.mass_oil == 4
 
 
 def test_oil_in_ice():
@@ -73,8 +74,8 @@ def test_oil_in_ice():
 
         o.run(duration=timedelta(hours=10))
 
-        latf = o.history['lat'][0][-1]
-        lonf = o.history['lon'][0][-1]
+        latf = o.result.lat.isel({'trajectory': 0, 'time': -1})
+        lonf = o.result.lon.isel({'trajectory': 0, 'time': -1})
 
         _azimuth1, _azimuth2, dist = geod.inv(lon, lat, lonf, latf)
 
@@ -96,7 +97,11 @@ def test_set_oil_type_by_id():
     o = OpenOil(loglevel=50)
     o.set_oiltype_by_id('NO00108')
     assert o.oiltype.name == 'AASGARD A 2003'
-    print(o.oiltype)
+    # Check that oiltype is also used after actual seeding
+    o.set_config('environment:constant', {
+        'x_wind': 0, 'y_wind': 0, 'x_sea_water_velocity': 0, 'y_sea_water_velocity': 0})
+    o.seed_elements(lon=0, lat=0, time=datetime.now())
+    assert o.oiltype.name == 'AASGARD A 2003'
 
 def test_oil_type_alias():
     o = OpenOil(loglevel=50)
@@ -133,7 +138,7 @@ def test_seed_oil_type():
     lonstart = 16.040701
     latend = 69.991446
     lonend = 17.760061
-    time = [datetime.utcnow(), datetime.utcnow() + timedelta(hours=12)]
+    time = [datetime.now(), datetime.now() + timedelta(hours=12)]
 
     # changing oil type on first seed is ok
     o.seed_cone(lon=[lonstart, lonend], lat=[latstart, latend],

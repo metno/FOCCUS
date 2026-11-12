@@ -19,15 +19,18 @@ from datetime import datetime
 import logging
 logger = logging.getLogger(__name__)
 
+import pandas as pd
 import numpy as np
 from netCDF4 import num2date
 import xarray as xr
 
-from opendrift.readers.basereader import BaseReader, vector_pairs_xy, StructuredReader
+from opendrift.readers import open_dataset_opendrift
+from opendrift.readers.basereader import vector_pairs_xy
+from opendrift.readers.basereader.structured import StructuredReader
 from opendrift.readers.roppy import depth
 
 
-class Reader(BaseReader, StructuredReader):
+class Reader(StructuredReader):
     """
     A reader for ROMS Output files. It can take a single file, a file pattern, a URL or an xarray Dataset.
 
@@ -87,6 +90,7 @@ class Reader(BaseReader, StructuredReader):
         self.sea_floor_depth_below_sea_level = None
         self.z_rho_tot = None
         self.s2z_A = None
+        self.hc = None
 
         if filename is None:
             raise ValueError('Need filename as argument to constructor')
@@ -111,6 +115,7 @@ class Reader(BaseReader, StructuredReader):
             'gls': 'turbulent_generic_length_scale',
             'tke': 'turbulent_kinetic_energy',
             'AKs': 'ocean_vertical_diffusivity',
+            'ln_AKs': 'ocean_vertical_diffusivity',
             'sustr': 'surface_downward_x_stress',
             'svstr': 'surface_downward_y_stress',
             'tair': 'air_temperature',
@@ -133,39 +138,20 @@ class Reader(BaseReader, StructuredReader):
             -2000, -2500, -3000, -3500, -4000, -4500, -5000, -5500, -6000,
             -6500, -7000, -7500, -8000])
 
-        gls_param = ['gls_cmu0', 'gls_p', 'gls_m', 'gls_n']
-        
         self.name = name or 'roms native'
 
-        if isinstance(filename, xr.Dataset):
-            self.Dataset = filename
-        else:
-
-            filestr = str(filename)
-
-            try:
-                # Open file, check that everything is ok
-                logger.info('Opening dataset: ' + filestr)
-                if ('*' in filestr) or ('?' in filestr) or ('[' in filestr):
-                    logger.info('Opening files with MFDataset')
-                    def drop_non_essential_vars_pop(ds):
-                        dropvars = [v for v in ds.variables if v not in
-                                    list(self.ROMS_variable_mapping.keys()) + gls_param +
-                                    ['ocean_time', 'time', 'bulk_time', 's_rho',
-                                     'Cs_r', 'hc', 'angle', 'Vtransform']
-                                    and v[0:3] not in ['lon', 'lat', 'mas']]
-                        logger.debug('Dropping variables: %s' % dropvars)
-                        ds = ds.drop_vars(dropvars)
-                        return ds
-                    self.Dataset = xr.open_mfdataset(filename,
-                        chunks={'ocean_time': 1}, compat='override', decode_times=False,
-                        preprocess=drop_non_essential_vars_pop,
-                        data_vars='minimal', coords='minimal')
-                else:
-                    logger.info('Opening file with Dataset')
-                    self.Dataset = xr.open_dataset(filename, decode_times=False)
-            except Exception as e:
-                raise ValueError(e)
+        def drop_non_essential_vars_pop(ds):
+            dropvars = [v for v in ds.variables if v not in
+                        list(self.ROMS_variable_mapping.keys()) +
+                        ['ocean_time', 'time', 'bulk_time', 's_rho',
+                         'Cs_r', 'Cs_rho', 'hc', 'angle', 'Vtransform', 'Vstretching']
+                        and v[0:3] not in ['lon', 'lat', 'mas']]
+            logger.debug('Dropping variables: %s' % dropvars)
+            ds = ds.drop_vars(dropvars)
+            return ds
+        self.Dataset = open_dataset_opendrift(source=filename,
+            open_mfdataset_options={'chunks': {'ocean_time': 1},
+                                    'preprocess': drop_non_essential_vars_pop})
 
         # this is an opporunity to save interpolators to pickle to save sim time
         self.save_interpolator = save_interpolator
@@ -173,7 +159,22 @@ class Reader(BaseReader, StructuredReader):
 
         if gridfile is not None:  # Merging gridfile dataset with main dataset
             gf = xr.open_dataset(gridfile)
-            self.Dataset = xr.merge([self.Dataset, gf])
+            for var in gf:
+                if var in self.Dataset:
+                    logger.warning(f'Skipping duplicate variable {var} from grdfile')
+                    gf = gf.drop_vars(var)
+            self.Dataset = xr.merge([self.Dataset, gf], compat='override')
+
+        for var in self.Dataset:  # Check for mis-named Croco-dimensions
+            dims = self.Dataset[var].dims
+            if 'eta_rho' in dims and 'xi_u' in dims:
+                logger.warning(f'Wrongly named dimensions of {var} in Croco output: ' +
+                               'Renaming dimensions (eta_rho, xi_u) to (eta_u, xi_u)')
+                self.Dataset[var] = self.Dataset[var].rename({'eta_rho': 'eta_u'})
+            elif 'eta_v' in dims and 'xi_rho' in dims:
+                logger.warning(f'Wrongly named dimensions of {var} in Croco output: ' +
+                               'Renaming dimensions (eta_v, xi_rho) to (eta_v, xi_v)')
+                self.Dataset[var] = self.Dataset[var].rename({'xi_rho': 'xi_v'})
 
         if 'Vtransform' in self.Dataset.variables:
             self.Vtransform = self.Dataset.variables['Vtransform'].data  # scalar
@@ -181,6 +182,13 @@ class Reader(BaseReader, StructuredReader):
             logger.warning('Vtransform not found, using 1')
             self.Vtransform = 1
         self.Vtransform = np.asarray(self.Vtransform)
+
+        if 'Vstretching' in self.Dataset.variables:
+            self.Vstretching = self.Dataset.variables['Vstretching'].data  # scalar
+        else:
+            logger.warning('Vstretching not found, using 1')
+            self.Vstretching = 1
+        self.Vstretching = np.asarray(self.Vstretching)
 
         if 's_rho' not in self.Dataset.variables:
             dimensions = 2
@@ -200,17 +208,24 @@ class Reader(BaseReader, StructuredReader):
                 self.sigma = (np.arange(num_sigma)+.5-num_sigma)/num_sigma
 
             # Read sigma-coordinate transform parameters
-            try:
-                self.Dataset.variables['Cs_r'].set_auto_mask(False)
-            except:
-                pass
-            self.Cs_r = self.Dataset.variables['Cs_r'][:]
-            try:
-                self.hc = self.Dataset.variables['hc'][:]
-            except:
-                self.hc = self.Dataset.variables['hc'].data  # scalar
+            if 'Cs_r' in self.Dataset.variables:
+                csr = 'Cs_r'  # ROMS
+            elif 'Cs_rho' in self.Dataset.variables:
+                csr = 'Cs_rho'  # CROCO
             else:
-                self.hc = None
+                csr = None
+
+            if csr is not None:
+                try:
+                    self.Dataset.variables[csr].set_auto_mask(False)
+                except:
+                    pass
+                self.Cs_r = self.Dataset.variables[csr][:]
+
+            try:
+                self.hc = self.Dataset.variables['hc'].values
+            except AttributeError:
+                self.hc = self.Dataset.variables['hc'][:]
 
             self.num_layers = len(self.sigma)
         else:
@@ -238,16 +253,6 @@ class Reader(BaseReader, StructuredReader):
             if var not in self.Dataset.variables:
                 del self.ROMS_variable_mapping[var]
 
-        try:  # Check for GLS parameters (diffusivity)
-            self.gls_parameters = {}
-            for gls_par in gls_param:
-                self.gls_parameters[gls_par] = \
-                    self.Dataset.variables[gls_par][()]
-            logger.info('Read GLS parameters from file.')
-        except Exception as e:
-            logger.info(e)
-            logger.info('Did not find complete set of GLS parameters')
-
         # Get time coverage
         ocean_time = None
         for tv in ['ocean_time', 'time', 'bulk_time']:
@@ -255,16 +260,19 @@ class Reader(BaseReader, StructuredReader):
                 ocean_time = self.Dataset.variables[tv]
         if ocean_time is None:
             raise ValueError('Time variable not found in ROMS file')
-        time_units = ocean_time.attrs['units']
-        if time_units == 'second':
-            logger.info('Ocean time given as seconds relative to start '
-                         'Setting artifical start time of 1 Jan 2000.')
-            time_units = 'seconds since 2000-01-01 00:00:00'
-        if time_units == 'days':
-            logger.info('Ocean time given as days relative to start '
-                         'Setting artifical start time of 1 Jan 2000.')
-            time_units = 'days since 2000-01-01 00:00:00'
-        self.times = num2date(ocean_time[:], time_units)
+        if np.issubdtype(ocean_time.dtype, np.datetime64):
+            self.times = pd.to_datetime(ocean_time).to_pydatetime()
+        else:  # We must decode manually - necessary hack for ROMS-Croco since not CF compatible
+            time_units = ocean_time.attrs['units']
+            if time_units == 'second':
+                logger.info('Ocean time given as seconds relative to start '
+                            'Setting artifical start time of 1 Jan 2000.')
+                time_units = 'seconds since 2000-01-01 00:00:00'
+            if time_units == 'days':
+                logger.info('Ocean time given as days relative to start '
+                            'Setting artifical start time of 1 Jan 2000.')
+                time_units = 'days since 2000-01-01 00:00:00'
+            self.times = num2date(ocean_time[:], time_units)
         self.start_time = self.times[0]
         self.end_time = self.times[-1]
         if len(self.times) > 1:
@@ -425,6 +433,22 @@ class Reader(BaseReader, StructuredReader):
                 raise ValueError('No angle between xi and east found')
         return self._angle
 
+    def _ensure_s2z_coefficients(self):
+        """Whole-domain s2z A,C from multi_zslice, once per Dataset."""
+        if self.s2z_A is not None:
+            return
+        logger.debug('Calculating sigma2z-coefficients for whole domain')
+        starttime = datetime.now()
+        M = self.sea_floor_depth_below_sea_level.shape[0]
+        N = self.sea_floor_depth_below_sea_level.shape[1]
+        O = len(self.z_rho_tot)
+        dummyvar = np.ones((O, M, N))
+        dummy, self.s2z_A, self.s2z_C, self.s2z_I, self.s2z_kmax = depth.multi_zslice(
+            dummyvar, self.z_rho_tot, self.zlevels)
+        self.s2z_A = self.s2z_A.reshape(len(self.zlevels), M, N)
+        self.s2z_C = self.s2z_C.reshape(len(self.zlevels), M, N)
+        logger.info('Time: ' + str(datetime.now() - starttime))
+
     def get_variables(self, requested_variables, time=None,
                       x=None, y=None, z=None, testing=False):
         start_time = datetime.now()
@@ -470,10 +494,12 @@ class Reader(BaseReader, StructuredReader):
         buffer = self.buffer
         # Avoiding the last pixel in each dimension, since there are
         # several grids which are shifted (rho, u, v, psi)
-        indx = np.arange(np.max([0, indx.min()-buffer]),
-                            np.min([indx.max()+buffer, self.lon.shape[1]-1]))
-        indy = np.arange(np.max([0, indy.min()-buffer]),
-                            np.min([indy.max()+buffer, self.lon.shape[0]-1]))
+        xi1 = int(np.max([0, indx.min()-buffer]))
+        xi2 = int(np.min([indx.max()+buffer, self.lon.shape[1]-1]))
+        yi1 = int(np.max([0, indy.min()-buffer]))
+        yi2 = int(np.min([indy.max()+buffer, self.lon.shape[0]-1]))
+        indx = np.arange(xi1, xi2)
+        indy = np.arange(yi1, yi2)
 
         # define indices
         ixy = (indy,indx)
@@ -488,7 +514,7 @@ class Reader(BaseReader, StructuredReader):
 
         # Find depth levels covering all elements
         if z.min() == 0 or self.hc is None:
-            indz = self.num_layers - 1  # surface layer
+            inds = self.num_layers - 1  # surface layer
             variables['z'] = 0
 
         else:
@@ -502,7 +528,8 @@ class Reader(BaseReader, StructuredReader):
                 Htot = self.sea_floor_depth_below_sea_level
                 zeta = self.zeta[indxTime]
                 self.z_rho_tot = depth.sdepth(Htot, zeta, self.hc, self.Cs_r,
-                                              Vtransform=self.Vtransform)
+                                              Vtransform=self.Vtransform,
+					      Vstretching=self.Vstretching)
                 # z_rho is positive relative to mean sea level but z is
                 # 0 at the surface.
                 # Transform z_rho to match convention of z.
@@ -511,7 +538,8 @@ class Reader(BaseReader, StructuredReader):
             H = self.sea_floor_depth_below_sea_level[indy, indx]
             zeta = self.zeta[itxy]
             z_rho = depth.sdepth(H, zeta, self.hc, self.Cs_r,
-                                 Vtransform=self.Vtransform)
+                                 Vtransform=self.Vtransform,
+				 Vstretching=self.Vstretching)
 
             # z_rho is positive relative to mean sea level but z is
             # 0 at the surface.
@@ -531,17 +559,16 @@ class Reader(BaseReader, StructuredReader):
             indy_el = np.clip(indy_el - indy.min(), 0, z_rho.shape[1]-1)
 
             # Loop to find the layers covering the requested z-values
-            indz_min = 0
-            indz_max = self.num_layers
+            inds_min = 0
+            inds_max = self.num_layers
             for i in range(self.num_layers):
                 if np.min(z-z_rho[i, indy_el, indx_el]) > 0:
-                    indz_min = i
+                    inds_min = i
                 if np.max(z-z_rho[i, indy_el, indx_el]) > 0:
-                    indz_max = i
-            indz = range(np.maximum(0, indz_min-self.verticalbuffer),
+                    inds_max = i
+            inds = range(np.maximum(0, inds_min-self.verticalbuffer),
                          np.minimum(self.num_layers,
-                                    indz_max + 1 + self.verticalbuffer))
-            z_rho = z_rho[indz, :, :]
+                                    inds_max + 1 + self.verticalbuffer))
             # Determine the z-levels to which to interpolate
             zi1 = np.maximum(0, bisect_left(-np.array(self.zlevels),
                                             -z.max()) - self.verticalbuffer)
@@ -551,7 +578,7 @@ class Reader(BaseReader, StructuredReader):
             variables['z'] = np.array(self.zlevels[zi1:zi2])
         
         # define another set of indices
-        itzxy = (indxTime, indz, indy, indx)
+        itsxy = (indxTime, inds, indy, indx)
             
         def get_mask(mask_name, imask, masks_store):
             if mask_name in masks_store:
@@ -561,6 +588,7 @@ class Reader(BaseReader, StructuredReader):
             return mask, mask_name
 
         masks_store = {}  # To store masks for various grids
+        s2z_inds_finalized = False
         for par in requested_variables:
             varname = self.standard_name_mapping[par]
             var = self.Dataset.variables[varname]
@@ -574,7 +602,41 @@ class Reader(BaseReader, StructuredReader):
             elif var.ndim == 3:
                 variables[par] = var[itxy]
             elif var.ndim == 4:
-                variables[par] = var[itzxy]
+                # 4D fields F are read on sigma layers, then interpolated to
+                # z-levels by R = (1-A)*F[C-1] + A*F[C], where C and C-1 are
+                # the sigma layers above and below the required z. With
+                # precalculate_s2z_coefficients == True, C comes from the
+                # whole-domain table as a full-column index, 0 = seabed to
+                # num_layers-1 = surface.
+                #
+                # To save I/O we read F only for a subset of layers:
+                # inds -> itsxy -> variables[par] -> F. So F[0] is layer
+                # si_bottom, not layer 0. Before C can be used,
+                # inds must contain every layer C and C-1 over
+                # [zi1:zi2, yi1:yi2, xi1:xi2], so it is expanded to cover
+                # [C_bottom-1 .. C_top]. C is then shifted to F numbering
+                # by C = C - si_bottom (below).
+                #
+                # Done once, on the first 4D field; later fields reuse it.
+                if not s2z_inds_finalized:
+                    if (self.precalculate_s2z_coefficients is True and
+                            len(np.atleast_1d(inds)) > 1):
+                        si_bottom, si_top = int(min(inds)), int(max(inds))
+                        self._ensure_s2z_coefficients()
+                        C = np.asarray(self.s2z_C[zi1:zi2, yi1:yi2, xi1:xi2])
+                        # multi_zslice always returns finite clipped ints;
+                        # this guard is only for a degenerate empty slice.
+                        if C.size:
+                            C_bottom = int(C.min())
+                            C_top = int(C.max())
+                            si_bottom = int(min(si_bottom, max(0, C_bottom - 1)))
+                            si_top = int(max(si_top, min(self.num_layers - 1, C_top)))
+                            inds = range(si_bottom, si_top + 1)
+                        itsxy = (indxTime, inds, indy, indx)
+                    if not np.isscalar(inds):
+                        z_rho = z_rho[inds, :, :]
+                    s2z_inds_finalized = True
+                variables[par] = var[itsxy]
             else:
                 raise Exception('Wrong dimension of variable: ' +
                                 self.ROMS_variable_mapping[par])
@@ -606,38 +668,20 @@ class Reader(BaseReader, StructuredReader):
 
             if var.ndim == 4:
                 # Regrid from sigma to z levels
-                if len(np.atleast_1d(indz)) > 1:
+                if len(np.atleast_1d(inds)) > 1:
                     logger.debug('sigma to z for ' + varname)
                     if self.precalculate_s2z_coefficients is True:
-                        M = self.sea_floor_depth_below_sea_level.shape[0]
-                        N = self.sea_floor_depth_below_sea_level.shape[1]
-                        O = len(self.z_rho_tot)
-                        if self.s2z_A is None:
-                            logger.debug('Calculating sigma2z-coefficients for whole domain')
-                            starttime = datetime.now()
-                            dummyvar = np.ones((O, M, N))
-                            dummy, self.s2z_total = depth.multi_zslice(dummyvar, self.z_rho_tot, self.zlevels)
-                            # Store arrays/coefficients
-                            self.s2z_A = self.s2z_total[0].reshape(len(self.zlevels), M, N)
-                            self.s2z_C = self.s2z_total[1].reshape(len(self.zlevels), M, N)
-                            #self.s2z_I = self.s2z_total[2].reshape(M, N)
-                            self.s2z_kmax = self.s2z_total[3]
-                            del self.s2z_total  # Free memory
-                            logger.info('Time: ' + str(datetime.now() - starttime))
+                        self._ensure_s2z_coefficients()
                         if 'A' not in locals():
                             logger.debug('Re-using sigma2z-coefficients')
                             # Select relevant subset of full arrays
                             zle = np.arange(zi1, zi2)  # The relevant depth levels
-                            A = self.s2z_A.copy()  # Awkward subsetting to prevent losing one dimension
-                            A = A[:,:,indx]
-                            A = A[:,indy,:]
-                            A = A[zle,:,:]
-                            C = self.s2z_C.copy()
-                            C = C[:,:,indx]
-                            C = C[:,indy,:]
-                            C = C[zle,:,:]
-                            C = C - C.max() + variables[par].shape[0] - 1
-                            C[C<1] = 1
+                            A = np.asarray(self.s2z_A[zi1:zi2, yi1:yi2, xi1:xi2])
+                            # Old (commit 0c734bf5): C - C.max() + N - 1 was
+                            # right only when C.max() == si_top; otherwise it
+                            # used the wrong sigma layers from F.
+                            C = C - si_bottom
+                            C[C<1] = 1  # keep C-1 >= 0 at the seabed
                             A = A.reshape(len(zle), len(indx)*len(indy))
                             C = C.reshape(len(zle), len(indx)*len(indy))
                             I = np.arange(len(indx)*len(indy))
@@ -655,9 +699,8 @@ class Reader(BaseReader, StructuredReader):
                             kmax = len(zle)  # Must be checked. Or number of sigma-layers?
                     if 'A' not in locals():
                         logger.debug('Calculating new sigma2z-coefficients')
-                        variables[par], s2z = depth.multi_zslice(
+                        variables[par], A,C,I,kmax = depth.multi_zslice(
                             variables[par], z_rho, variables['z'])
-                        A,C,I,kmax = s2z
                         # Reshaping to compare with subset of full array
                         #zle = np.arange(zi1, zi2)
                         #A = A.reshape(len(zle), len(indx), len(indy))
@@ -767,6 +810,9 @@ class Reader(BaseReader, StructuredReader):
                         variables['y_wind'], rad)
                 logger.debug('Rotated x_wind and y_wind')
 
+        if 'ocean_vertical_diffusivity' in variables.keys() and 'AKs' not in self.Dataset.variables:
+            variables['ocean_vertical_diffusivity'] = np.exp(variables['ocean_vertical_diffusivity'])
+            logger.info("Using AKs from ln_AKs.")
         # Masking NaN
         for var in requested_variables:
             variables[var] = np.ma.masked_invalid(variables[var])

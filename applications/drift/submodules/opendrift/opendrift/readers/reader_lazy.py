@@ -14,15 +14,14 @@
 #
 # Copyright 2015, Knut-Frode Dagestad, MET Norway
 
-import logging; logging.captureWarnings(True); logger = logging.getLogger(__name__)
+import logging; logging.captureWarnings(True);
+logger = logging.getLogger(__name__)
 from opendrift.readers.basereader import BaseReader
-from opendrift.readers import reader_from_url, reader_netCDF_CF_generic
+from opendrift.readers import reader_from_urlpath, reader_netCDF_CF_generic
 
 
 class Reader:
     '''For lazy initialisation'''
-
-    logger = logging.getLogger('opendrift')  # using common logger
 
     def __init__(self, *args, **kwargs):
         self._args = args
@@ -62,7 +61,7 @@ class Reader:
             logger.debug('Lazy reader seems to be zarr, calling reader_netCDF_CF_generic')
             self.reader = reader_netCDF_CF_generic.Reader(filename=self._dataset, zarr_storage_options=self._kwargs['zarr_credentials'], name=self._lazyname)
         else:
-            self.reader = reader_from_url(self._args[0])
+            self.reader = reader_from_urlpath(self._args[0])
 
         if self.reader is None:
             raise ValueError('Reader could not be initialised')

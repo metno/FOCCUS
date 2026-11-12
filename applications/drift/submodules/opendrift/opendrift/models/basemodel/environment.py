@@ -8,7 +8,7 @@ from opendrift.timer import Timeable
 from opendrift.config import CONFIG_LEVEL_BASIC, CONFIG_LEVEL_ADVANCED
 from opendrift.readers.basereader import BaseReader, standard_names
 from opendrift.readers.reader_lazy import Reader
-from opendrift.readers import reader_from_url, reader_global_landmask
+from opendrift.readers import reader_from_urlpath, reader_global_landmask
 from opendrift.errors import NotCoveredError
 from opendrift.models import physics_methods as pm
 
@@ -36,7 +36,7 @@ class Environment(Timeable, Configurable):
         self.discarded_readers = {}
 
         self.required_variables = required_variables
-        self._config = _config # reference to simulation config
+        self._config = _config  # reference to simulation config
 
         # Add constant and fallback environment variables to config
         c = {}
@@ -64,35 +64,25 @@ class Environment(Timeable, Configurable):
                 'description': description_constant
             }
             c['environment:fallback:%s' % v] = {
-                'type':
-                'float',
-                'min':
-                minval,
-                'max':
-                maxval,
-                'units':
-                units,
-                'default':
-                self.required_variables[v]['fallback']
-                if 'fallback' in self.required_variables[v] else None,
-                'level':
-                CONFIG_LEVEL_BASIC,
-                'description':
-                description_fallback
+                'type': 'float',
+                'min': minval,
+                'max': maxval,
+                'units': units,
+                'default': self.required_variables[v]['fallback'] if 'fallback'
+                           in self.required_variables[v] else None,
+                'level': CONFIG_LEVEL_BASIC,
+                'description': description_fallback
             }
         self._add_config(c)
 
         self._add_config({
             'general:use_auto_landmask': {
-                'type':
-                'bool',
-                'default':
-                True,
+                'type': 'bool',
+                'default': True,
                 'description':
-                'A built-in GSHHG global landmask is used if True, '
-                'otherwise landmask is taken from reader or fallback value.',
-                'level':
-                CONFIG_LEVEL_ADVANCED
+                    'A built-in GSHHG global landmask is used if True, '
+                    'otherwise landmask is taken from reader or fallback value.',
+                'level': CONFIG_LEVEL_ADVANCED
             },
             'drift:current_uncertainty': {
                 'type': 'float',
@@ -100,8 +90,7 @@ class Environment(Timeable, Configurable):
                 'min': 0,
                 'max': 5,
                 'units': 'm/s',
-                'description':
-                'Add gaussian perturbation with this standard deviation to current components at each time step',
+                'description': 'Add gaussian perturbation with this standard deviation to current components at each time step',
                 'level': CONFIG_LEVEL_ADVANCED
             },
             'drift:current_uncertainty_uniform': {
@@ -110,8 +99,7 @@ class Environment(Timeable, Configurable):
                 'min': 0,
                 'max': 5,
                 'units': 'm/s',
-                'description':
-                'Add gaussian perturbation with this standard deviation to current components at each time step',
+                'description': 'Add gaussian perturbation with this standard deviation to current components at each time step',
                 'level': CONFIG_LEVEL_ADVANCED
             },
             'drift:max_speed': {
@@ -120,8 +108,7 @@ class Environment(Timeable, Configurable):
                 'min': 0,
                 'max': np.inf,
                 'units': 'seconds',
-                'description':
-                'Typical maximum speed of elements, used to estimate reader buffer size',
+                'description': 'Typical maximum speed of elements, used to estimate reader buffer size',
                 'level': CONFIG_LEVEL_ADVANCED
             },
             'readers:max_number_of_fails': {
@@ -130,8 +117,7 @@ class Environment(Timeable, Configurable):
                 'min': 0,
                 'max': 1e6,
                 'units': 'number',
-                'description':
-                'Readers are discarded if they fail (e.g. corrupted data, og hanging servers) move than this number of times',
+                'description': 'Readers are discarded if they fail (e.g. corrupted data, og hanging servers) move than this number of times',
                 'level': CONFIG_LEVEL_ADVANCED
             },
         })
@@ -139,15 +125,15 @@ class Environment(Timeable, Configurable):
         # Find variables which require profiles
         self.required_profiles = [
             var for var in self.required_variables
-            if 'profiles' in self.required_variables[var]
-            and self.required_variables[var]['profiles'] is True
+            if 'profiles' in self.required_variables[var] and
+            self.required_variables[var]['profiles'] is True
         ]
 
         # Find variables which are desired, but not required
         self.desired_variables = [
             var for var in self.required_variables
-            if 'important' in self.required_variables[var]
-            and self.required_variables[var]['important'] is False
+            if 'important' in self.required_variables[var] and
+            self.required_variables[var]['important'] is False
         ]
 
     def finalize(self, simulation_extent=None, start=None, end=None):
@@ -204,37 +190,33 @@ class Environment(Timeable, Configurable):
         if self.get_config('general:use_auto_landmask', False) is True:
             if 'land_binary_mask' in self.priority_list:
                 if 'global_landmask' in self.priority_list['land_binary_mask']:
-                    self.priority_list['land_binary_mask'] = [
-                        'global_landmask'
-                    ]
+                    self.priority_list['land_binary_mask'] = ['global_landmask']
                 else:
-                    if self.get_config('environment:constant:land_binary_mask') is None:
+                    if self.get_config(
+                            'environment:constant:land_binary_mask') is None:
                         del self.priority_list['land_binary_mask']
 
         if self.get_config('general:use_auto_landmask', False) is True and \
                 ('land_binary_mask' in self.required_variables and \
                 'land_binary_mask' not in self.priority_list):
             if self.get_config('environment:constant:land_binary_mask') is None:
-                logger.info(
-                    'Adding a dynamical landmask with max. priority based on '
-                    'assumed maximum speed of %s m/s. '
-                    'Adding a customised landmask may be faster...' %
-                    self.get_config('drift:max_speed'))
-                self.timer_start('preparing main loop:making dynamical landmask')
+                logger.info('Adding a global landmask from GSHHG')
+                self.timer_start('preparing main loop:loading global landmask')
                 reader_landmask = reader_global_landmask.Reader()
                 self.add_reader(reader_landmask)
-                self.timer_end('preparing main loop:making dynamical landmask')
+                self.timer_end('preparing main loop:loading global landmask')
             else:
-                logger.warning('Using constant reader for land_binary_mask, ' 
-                               'although config general:use_auto_landmask is True')
+                logger.warning(
+                    'Using constant reader for land_binary_mask, '
+                    'although config general:use_auto_landmask is True')
 
     def __assert_no_missing_variables__(self):
         missing_variables = self.missing_variables()
         if len(missing_variables) > 0:
             has_fallback = [
-                var for var in missing_variables
-                if (self.get_config(f'environment:fallback:{var}') is not None or
-                    self.get_config(f'environment:constant:{var}') is not None)
+                var for var in missing_variables if
+                (self.get_config(f'environment:fallback:{var}') is not None or
+                 self.get_config(f'environment:constant:{var}') is not None)
             ]
             has_no_fallback = [
                 var for var in missing_variables
@@ -245,7 +227,9 @@ class Environment(Timeable, Configurable):
                 logger.info('Fallback values will be used for the following '
                             'variables which have no readers: ')
                 for var in has_fallback:
-                    logger.info('\t%s: %f' % (var, self.get_config(f'environment:fallback:{var}')))
+                    logger.info(
+                        '\t%s: %f' %
+                        (var, self.get_config(f'environment:fallback:{var}')))
             if len(has_no_fallback) > 0 and len(
                     self._lazy_readers()) == 0:  # == missing_variables:
                 logger.warning(
@@ -255,28 +239,28 @@ class Environment(Timeable, Configurable):
                                  'following required variables: ' +
                                  str(has_no_fallback))
 
-    def add_readers_from_file(self, filename, timeout=10, lazy=True):
-        fp = open(filename, 'r')
-        sources = fp.readlines()
-        sources = [line.strip() for line in sources if line[0] != '#']
-        self.add_readers_from_list(sources, timeout, lazy=lazy)
+    def add_readers_from_file(self, filename, lazy=True):
+        with open(filename, 'r') as f:
+            sources = f.readlines()
+            sources = [line.strip() for line in sources if line[0] != '#']
+            self.add_readers_from_list(sources, lazy=lazy)
 
     def add_readers_from_list(self,
                               urls,
-                              timeout=10,
                               lazy=True,
                               variables=None):
         '''Make readers from a list of URLs or paths to netCDF datasets'''
 
         if isinstance(urls, str):
             urls = [urls]
+        urls = [u.strip() for u in urls]  # strip whitespace
         if lazy is True:
             from opendrift.readers.reader_lazy import Reader
             readers = [Reader(u) for u in urls]
             self.add_reader(readers, variables=variables)
             return
 
-        readers = [reader_from_url(u, timeout) for u in urls]
+        readers = [reader_from_urlpath(u) for u in urls]
         self.add_reader([r for r in readers if r is not None],
                         variables=variables)
 
@@ -336,8 +320,7 @@ class Environment(Timeable, Configurable):
                                 self.priority_list[variable].insert(
                                     0, reader.name)
                             else:
-                                self.priority_list[variable].append(
-                                    reader.name)
+                                self.priority_list[variable].append(reader.name)
                     else:
                         self.priority_list[variable] = [reader.name]
 
@@ -437,7 +420,7 @@ class Environment(Timeable, Configurable):
             return False
         if reader.start_time is not None and reader.always_valid is False:
             if hasattr(self, 'expected_end_time'
-                       ) and reader.start_time > self.expected_end_time:
+                      ) and reader.start_time > self.expected_end_time:
                 self.discard_reader(reader, 'starts after simulation end')
                 return True
             if hasattr(self,
@@ -445,8 +428,7 @@ class Environment(Timeable, Configurable):
                 self.discard_reader(reader, 'ends before simuation start')
                 return True
             if time is not None and reader.end_time < time:
-                self.discard_reader(reader,
-                                    'ends before simuation is finished')
+                self.discard_reader(reader, 'ends before simuation is finished')
                 return True
         if len(set(self.required_variables) & set(reader.variables)) == 0:
             self.discard_reader(
@@ -459,15 +441,14 @@ class Environment(Timeable, Configurable):
                         'Simulation has no simulation_extent, cannot check reader coverage'
                     )
                     return False
-                # TODO
-                # need a better coverage/overlap check below
-                corners = reader.xy2lonlat(
-                    [reader.xmin, reader.xmin, reader.xmax, reader.xmax],
-                    [reader.ymax, reader.ymin, reader.ymax, reader.ymin])
-                rlonmin = np.min(corners[0])
-                rlonmax = np.max(corners[0])
-                rlatmin = np.min(corners[1])
-                rlatmax = np.max(corners[1])
+                # NOTE: A better overlap test has been implemented
+                bbox = reader.lonlat_bounds()
+                rlonmin = bbox[0]
+                rlonmax = bbox[2]
+                rlatmin = bbox[1]
+                rlatmax = bbox[3]
+                # This seems like a fix e.g. for TOPAZ5
+                # TODO: We might handle the case of a dataset which covers the pole(s) in lonlat_bounds as well
                 if hasattr(
                         reader, 'proj4'
                 ) and 'stere' in reader.proj4 and 'lat_0=90' in reader.proj4:
@@ -514,7 +495,15 @@ class Environment(Timeable, Configurable):
             if var not in self.priority_list
         ]
 
-    def get_environment(self, variables, time, lon, lat, z, profiles=None, profiles_depth=None):
+    def get_environment(self,
+                        variables,
+                        time,
+                        lon,
+                        lat,
+                        z,
+                        profiles=None,
+                        profiles_depth=None,
+                        element_ID=None):
         '''Retrieve environmental variables at requested positions.
 
         Args:
@@ -532,6 +521,8 @@ class Environment(Timeable, Configurable):
             profiles: list of variables for which profiles are needed
 
             profiles_depth: depth of profiles in meters, as a positive number
+
+            element_ID: ID of actual elements, for the readers that might provide data based on this ID (exception)
 
         Updates:
             Buffer (raw data blocks) for each reader stored for performance:
@@ -558,7 +549,8 @@ class Environment(Timeable, Configurable):
             self.discard_reader_if_not_relevant(reader, time)
 
         if profiles_depth is None:
-            profiles_depth = np.abs(z).max()
+            z_arr = np.asarray(z)
+            profiles_depth = np.abs(z_arr).max() if z_arr.size > 0 else 0.0
         if 'drift:truncate_ocean_model_below_m' in self._config:
             truncate_depth = self.get_config(
                 'drift:truncate_ocean_model_below_m')
@@ -587,8 +579,8 @@ class Environment(Timeable, Configurable):
                         if self.discard_reader_if_not_relevant(reader, time):
                             reader = None
                     if reader is not None:
-                        if (reader.covers_time(time) and len(
-                                reader.covers_positions(lon, lat)[0]) > 0):
+                        if (reader.covers_time(time) and
+                                len(reader.covers_positions(lon, lat)[0]) > 0):
                             missing_variables = list(
                                 set(missing_variables) - set(reader.variables))
                             if len(missing_variables) == 0:
@@ -602,8 +594,7 @@ class Environment(Timeable, Configurable):
             if co is not None:
                 env[variable] = np.ma.ones(env[variable].shape) * co
 
-        for variable_group, reader_group in zip(variable_groups,
-                                                reader_groups):
+        for variable_group, reader_group in zip(variable_groups, reader_groups):
             logger.debug('----------------------------------------')
             logger.debug('Variable group %s' % (str(variable_group)))
             logger.debug('----------------------------------------')
@@ -622,10 +613,14 @@ class Environment(Timeable, Configurable):
                             logger.debug(
                                 'Missing variables: calling get_environment recursively'
                             )
-                            return self.get_environment(
-                                variables, time, lon, lat, z, profiles, profiles_depth)
+                            return self.get_environment(variables, time, lon,
+                                                        lat, z, profiles,
+                                                        profiles_depth, element_ID=element_ID)
                     continue
                 # Fetch given variables at given positions from current reader
+                if reader._element_ID is not None:
+                    logger.debug(f'Setting _element_ID for reader {reader_name}')
+                    reader._element_ID = element_ID[missing_indices]
                 try:
                     logger.debug('Data needed for %i elements' %
                                  len(missing_indices))
@@ -653,8 +648,9 @@ class Environment(Timeable, Configurable):
                             logger.debug(
                                 'Missing variables: calling get_environment recursively'
                             )
-                            return self.get_environment(
-                                variables, time, lon, lat, z, profiles, profiles_depth)
+                            return self.get_environment(variables, time, lon,
+                                                        lat, z, profiles,
+                                                        profiles_depth, element_ID=element_ID)
                     continue
 
                 except Exception as e:  # Unknown error
@@ -684,8 +680,9 @@ class Environment(Timeable, Configurable):
                             logger.debug(
                                 'Missing variables: calling get_environment recursively'
                             )
-                            return self.get_environment(
-                                variables, time, lon, lat, z, profiles, profiles_depth)
+                            return self.get_environment(variables, time, lon,
+                                                        lat, z, profiles,
+                                                        profiles_depth, element_ID=element_ID)
                     continue
 
                 # Copy retrieved variables to env array, and mask nan-values
@@ -755,8 +752,8 @@ class Environment(Timeable, Configurable):
                 except Exception as ex:  # Not sure what is happening here
                     logger.info('Problems setting mask on missing_indices!')
                     logger.exception(ex)
-                if (type(missing_indices)
-                        == np.int64) or (type(missing_indices) == np.int32):
+                if (type(missing_indices) == np.int64) or (type(missing_indices)
+                                                           == np.int32):
                     missing_indices = []
                 self.timer_end('main loop:readers:' +
                                reader_name.replace(':', '<colon>'))
@@ -771,8 +768,8 @@ class Environment(Timeable, Configurable):
                             logger.warning(
                                 'Missing variables: calling get_environment recursively'
                             )
-                            return self.get_environment(
-                                variables, time, lon, lat, z, profiles)
+                            return self.get_environment(variables, time, lon,
+                                                        lat, z, profiles, profiles_depth, element_ID=element_ID)
 
         logger.debug('---------------------------------------')
         logger.debug('Finished processing all variable groups')
@@ -808,12 +805,12 @@ class Environment(Timeable, Configurable):
                 else:
                     mask = env_profiles[var].mask
                     num_masked_values_per_element = np.sum(mask == True)
-                    num_missing_profiles = np.sum(num_masked_values_per_element
-                                                  == len(env_profiles['z']))
+                    num_missing_profiles = np.sum(
+                        num_masked_values_per_element == len(env_profiles['z']))
                     env_profiles[var][mask] = fallback
                     logger.debug(
-                        '      Using fallback value %s for %s for %s profiles'
-                        % (
+                        '      Using fallback value %s for %s for %s profiles' %
+                        (
                             fallback,
                             var,
                             num_missing_profiles,
@@ -832,8 +829,7 @@ class Environment(Timeable, Configurable):
         if 'sea_water_temperature' in variables:
             t_kelvin = np.where(env['sea_water_temperature'] > 100)[0]
             if len(t_kelvin) > 0:
-                logger.warning(
-                    'Converting temperatures from Kelvin to Celcius')
+                logger.warning('Converting temperatures from Kelvin to Celcius')
                 env['sea_water_temperature'][
                     t_kelvin] = env['sea_water_temperature'][t_kelvin] - 273.15
                 if 'env_profiles' in locals(
@@ -891,10 +887,8 @@ class Environment(Timeable, Configurable):
             std = self.get_config('drift:wind_uncertainty')
             if std > 0:
                 logger.debug('Adding uncertainty for wind: %s m/s' % std)
-                env['x_wind'] += np.random.normal(0, std,
-                                                  num_elements_active)
-                env['y_wind'] += np.random.normal(0, std,
-                                                  num_elements_active)
+                env['x_wind'] += np.random.normal(0, std, num_elements_active)
+                env['y_wind'] += np.random.normal(0, std, num_elements_active)
 
         #####################
         # Diagnostic output

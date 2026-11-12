@@ -16,9 +16,10 @@ time = datetime.now()
 # Current from HYCOM and wind from NCEP GFS
 o.add_readers_from_list([
     'https://tds.hycom.org/thredds/dodsC/FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd',
-    'https://pae-paha.pacioos.hawaii.edu/thredds/dodsC/ncep_global/NCEP_Global_Atmospheric_Model_best.ncd'])
+    'https://thredds.ucar.edu/thredds/dodsC/grib/NCEP/GFS/Global_0p25deg/Best'])
 o.set_config('environment:constant:ocean_mixed_layer_thickness', 20)
-o.set_config('drift', {'current_uncertainty': 0, 'wind_uncertainty': 0, 'horizontal_diffusivity': 20})
+o.set_config('environment:constant:horizontal_diffusivity', 20)
+o.set_config('drift', {'current_uncertainty': 0, 'wind_uncertainty': 0})
 
 #%%
 # Configuration
@@ -44,7 +45,7 @@ o.seed_elements(lon=lon, lat=lat, z=-150, radius=100, number=3000, time=time, **
 
 #%%
 # Running model
-o.run(duration=timedelta(days=5), time_step=3600, outfile='oil.nc')
+o.run(duration=timedelta(days=2), time_step=3600)
 
 #%%
 # Plot and animate results
@@ -58,8 +59,7 @@ o.plot_oil_budget(show_watercontent_and_viscosity=False, show_wind_and_current=F
 # Custom oil budget plot
 b = o.get_oil_budget()
 import matplotlib.pyplot as plt
-time, time_relative = o.get_time_array()
-time = np.array([t.total_seconds() / 3600. for t in time_relative])
+time = (o.result.time-o.result.time[0]).dt.total_seconds()/3600  # Hours since start
 fig, ax = plt.subplots()
 ax.plot(time, b['mass_submerged'], label='Submerged oil mass')
 ax.plot(time, b['mass_surface'], label='Surface oil mass')

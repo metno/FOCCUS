@@ -23,14 +23,13 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
+from opendrift import test_data_folder as tdf
 from opendrift.models.oceandrift import OceanDrift
 from opendrift.models.leeway import Leeway
 from opendrift.models.openoil import OpenOil
 from opendrift.readers import reader_netCDF_CF_generic
 from opendrift.readers import reader_ROMS_native
 from opendrift.readers import reader_constant
-from opendrift.readers import reader_from_url
-
 
 
 class TestWPS(unittest.TestCase):
@@ -38,7 +37,7 @@ class TestWPS(unittest.TestCase):
 
     def test_leeway_today(self):
         o = Leeway(loglevel=0)
-        o.add_readers_from_file(o.test_data_folder() +
+        o.add_readers_from_file(tdf +
             '../../opendrift/scripts/data_sources.txt')
         o.seed_elements(lon=14, lat=67.85, number=100, radius=1000,
                         time=datetime.now())
@@ -48,7 +47,7 @@ class TestWPS(unittest.TestCase):
 
     def test_leeway_yesterday(self):
         o = Leeway(loglevel=0)
-        o.add_readers_from_file(o.test_data_folder() +
+        o.add_readers_from_file(tdf +
             '../../opendrift/scripts/data_sources.txt')
         o.seed_elements(lon=14, lat=67.85, number=100, radius=1000,
                         time=datetime.now() - timedelta(days=1))
@@ -60,7 +59,7 @@ class TestWPS(unittest.TestCase):
 
     def test_leeway_global_today(self):
         o = Leeway(loglevel=0)
-        o.add_readers_from_file(o.test_data_folder() +
+        o.add_readers_from_file(tdf +
             '../../opendrift/scripts/data_sources.txt')
         o.seed_elements(lon=50, lat=29, number=100, radius=1000,
                         time=datetime.now())
@@ -70,7 +69,7 @@ class TestWPS(unittest.TestCase):
 
     def test_leeway_global_one_month_ago(self):
         o = Leeway(loglevel=0)
-        o.add_readers_from_file(o.test_data_folder() +
+        o.add_readers_from_file(tdf +
             '../../opendrift/scripts/data_sources.txt')
         o.seed_elements(lon=50, lat=29, number=100, radius=1000,
                         time=datetime.now() - timedelta(days=30))
@@ -82,7 +81,7 @@ class TestWPS(unittest.TestCase):
 
     def test_openoil_today(self):
         o = OpenOil(loglevel=0)
-        o.add_readers_from_file(o.test_data_folder() +
+        o.add_readers_from_file(tdf +
             '../../opendrift/scripts/data_sources.txt')
         o.seed_elements(lon=14, lat=67.85, number=100, radius=1000,
                         time=datetime.now())
@@ -92,7 +91,7 @@ class TestWPS(unittest.TestCase):
 
     def test_openoil_yesterday(self):
         o = OpenOil(loglevel=0)
-        o.add_readers_from_file(o.test_data_folder() +
+        o.add_readers_from_file(tdf +
             '../../opendrift/scripts/data_sources.txt')
         o.seed_elements(lon=14, lat=67.85, number=100, radius=1000,
                         time=datetime.now() - timedelta(days=1))
@@ -102,7 +101,7 @@ class TestWPS(unittest.TestCase):
 
     def test_openoil_global_today(self):
         o = OpenOil(loglevel=0)
-        o.add_readers_from_file(o.test_data_folder() +
+        o.add_readers_from_file(tdf +
             '../../opendrift/scripts/data_sources.txt')
         o.seed_elements(lon=50, lat=29, number=100, radius=1000,
                         time=datetime.now())
@@ -112,7 +111,7 @@ class TestWPS(unittest.TestCase):
 
     def test_openoil_global_one_month_ago(self):
         o = OpenOil(loglevel=0)
-        o.add_readers_from_file(o.test_data_folder() +
+        o.add_readers_from_file(tdf +
             '../../opendrift/scripts/data_sources.txt')
         o.seed_elements(lon=50, lat=29, number=100, radius=1000,
                         time=datetime.now() - timedelta(days=30))
@@ -139,7 +138,7 @@ class TestWPS(unittest.TestCase):
 
     #def test_lazy_reader_oildrift_real(self):
     #    o = OpenOil(loglevel=0)
-    #    o.add_readers_from_file(o.test_data_folder() +
+    #    o.add_readers_from_file(tdf +
     #        '../../opendrift/scripts/data_sources.txt')
 
     #    o.seed_elements(lon=4, lat=60.0,

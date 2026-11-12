@@ -21,11 +21,10 @@ import numpy as np
 import xarray as xr
 from datetime import datetime
 
-from .basereader import BaseReader
 from .basereader.structured import StructuredReader
 
 
-class Reader(BaseReader, StructuredReader):
+class Reader(StructuredReader):
     dataset = None
     variables = None
 
@@ -54,7 +53,7 @@ class Reader(BaseReader, StructuredReader):
         # convert to python datetime
         assert '[ns]' in self.times.dtype.str, "datetime is not in nanoseconds"
         self.times = np.array([
-            datetime.utcfromtimestamp(d.astype('int') / 1e9)
+            datetime.fromtimestamp(d.astype('int') / 1e9)
             for d in self.times
         ])
 

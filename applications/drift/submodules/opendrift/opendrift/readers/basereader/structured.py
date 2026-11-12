@@ -6,13 +6,13 @@ from abc import abstractmethod
 from pathlib import Path
 
 from opendrift.readers.interpolation.structured import ReaderBlock
-from .variables import Variables
+from . import BaseReader
 
 import logging
 logger = logging.getLogger(__name__)
 
 
-class StructuredReader(Variables):
+class StructuredReader(BaseReader):
     """
     A structured reader. Data is gridded on a regular grid. Used by e.g.:
     :class:`opendrift.readers.reader_netCDF_CF_generic.Reader`.
@@ -47,9 +47,7 @@ class StructuredReader(Variables):
         if self.proj is None and (self.proj4 is None
                                   or self.proj4 == 'fakeproj'):
 
-            logger.warning(
-                "No proj string or projection could be derived, using 'fakeproj'. This assumes that the variables are structured and gridded approximately equidistantly on the surface (i.e. in meters). This must be guaranteed by the user. You can get rid of this warning by supplying a valid projection to the reader."
-            )
+            logger.warning(f"No proj string or projection could be derived for reader {self.name}, using 'fakeproj'.")
 
             from scipy.interpolate import LinearNDInterpolator
             import copy
@@ -283,7 +281,8 @@ class StructuredReader(Variables):
                 )
             self.var_block_before[blockvars_before] = \
                 ReaderBlock(reader_data_dict,
-                            interpolation_horizontal=self.interpolation)
+                            interpolation_horizontal=self.interpolation,
+                            wrap_x=self.global_coverage())
             try:
                 len_z = len(self.var_block_before[blockvars_before].z)
             except:
@@ -304,7 +303,8 @@ class StructuredReader(Variables):
                 self.var_block_after[blockvars_after] = \
                     ReaderBlock(
                         reader_data_dict,
-                        interpolation_horizontal=self.interpolation)
+                        interpolation_horizontal=self.interpolation,
+                        wrap_x=self.global_coverage())
                 try:
                     len_z = len(self.var_block_after[blockvars_after].z)
                 except:
@@ -410,6 +410,23 @@ class StructuredReader(Variables):
             :meth:`.variables.Variables.__check_env_arrays__`.
         """
         return env
+
+    def lonlat_bounds(self, densify_pts=21):
+        """
+        Override method from variables
+        """
+        if self.projected:
+            return super().lonlat_bounds(densify_pts)
+        
+        corn = self.xy2lonlat(
+            [self.xmin, self.xmin, self.xmax, self.xmax],
+            [self.ymax, self.ymin, self.ymax, self.ymin]
+        )
+        lonmin = np.min(corn[0])
+        lonmax = np.max(corn[0])
+        latmin = np.min(corn[1])
+        latmax = np.max(corn[1])
+        return (lonmin, latmin, lonmax, latmax)
 
     def xy2lonlat(self, x, y):
         if self.projected:

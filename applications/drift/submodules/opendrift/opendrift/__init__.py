@@ -8,10 +8,14 @@ Opendrift module
     >>> import opendrift
 
 """
+import os
 import logging; logger = logging.getLogger(__name__)
 import importlib
 import numpy as np
 from .version import __version__
+
+
+test_data_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tests', 'test_data')) + os.path.sep
 
 # For automated access to available drift classes, e.g. for GUI
 # Hardcoded for now
@@ -19,9 +23,10 @@ _available_models = \
     ['leeway.Leeway',
      'openoil.OpenOil',
      'larvalfish.LarvalFish',
+     'larvalfish_extended.LarvalFishExtended',
      'plastdrift.PlastDrift',
      'shipdrift.ShipDrift',
-     'openberg_old.OpenBergOld']
+     'openberg.OpenBerg']
 
 def get_model_names():
     return [m.split('.')[-1] for m in _available_models]
@@ -38,21 +43,25 @@ def get_model(model_name):
                 return model
 
 
-def open(filename, times=None, elements=None, load_history=True):
+def open(filename):
     '''Import netCDF output file as OpenDrift object of correct class'''
 
     import os
+    import xarray as xr
     import pydoc
-    from netCDF4 import Dataset
-    if not os.path.exists(filename):
-        logger.info('File does not exist, trying to retrieve from URL')
-        import urllib
-        try:
-            urllib.urlretrieve(filename, 'opendrift_tmp.nc')
-            filename = 'opendrift_tmp.nc'
-        except:
-            raise ValueError('%s does not exist' % filename)
-    n = Dataset(filename)
+    #from netCDF4 import Dataset
+    if isinstance(filename, xr.Dataset):
+        n = filename
+    else:
+        if not os.path.exists(filename):
+            logger.info('File does not exist, trying to retrieve from URL')
+            import urllib
+            try:
+                urllib.urlretrieve(filename, 'opendrift_tmp.nc')
+                filename = 'opendrift_tmp.nc'
+            except:
+                raise ValueError('%s does not exist' % filename)
+        n = xr.open_dataset(filename)
     try:
         module_name = n.opendrift_module
         class_name = n.opendrift_class
@@ -63,72 +72,25 @@ def open(filename, times=None, elements=None, load_history=True):
         class_name = 'OceanDrift'
     n.close()
 
-    if class_name == 'OpenOil3D':
-        class_name = 'OpenOil'
-        module_name = 'opendrift.models.openoil'
-    if class_name == 'OceanDrift3D':
-        class_name = 'OceanDrift'
-        module_name = 'opendrift.models.oceandrift'
     cls = pydoc.locate(module_name + '.' + class_name)
     if cls is None:
         from opendrift.models import oceandrift
         cls = oceandrift.OceanDrift
     o = cls()
-    o.io_import_file(filename, times=times, elements=elements, load_history=load_history)
-    logger.info('Returning ' + str(type(o)) + ' object')
-    return o
-
-def open_xarray(filename, chunks={'trajectory': 50000, 'time': 1000}, elements=None):
-    '''Import netCDF output file as OpenDrift object of correct class'''
-
-    import os
-    import pydoc
-    import xarray as xr
-    if not os.path.exists(filename):
-        logger.info('File does not exist, trying to retrieve from URL')
-        import urllib
-        try:
-            urllib.urlretrieve(filename, 'opendrift_tmp.nc')
-            filename = 'opendrift_tmp.nc'
-        except:
-            raise ValueError('%s does not exist' % filename)
-    n = xr.open_dataset(filename)
-    try:
-        module_name = n.opendrift_module
-        class_name = n.opendrift_class
-    except:
-        raise ValueError(filename + ' does not contain '
-                         'necessary global attributes '
-                         'opendrift_module and opendrift_class')
-    n.close()
-
-    if class_name == 'OpenOil3D':
-        class_name = 'OpenOil'
-        module_name = 'opendrift.models.openoil'
-    if class_name == 'OceanDrift3D':
-        class_name = 'OceanDrift'
-        module_name = 'opendrift.models.oceandrift'
-    cls = pydoc.locate(module_name + '.' + class_name)
-    if cls is None:
-        from opendrift.models import oceandrift
-        cls = oceandrift.OceanDrift
-    o = cls()
-    o.io_import_file_xarray(filename, chunks=chunks, elements=elements)
-
+    o.io_import_file(filename)  #, times=times, elements=elements, load_history=load_history)
     logger.info('Returning ' + str(type(o)) + ' object')
     return o
 
 def versions():
+    def version(package):
+        try:
+            from importlib.metadata import version
+            return importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            return "N/A"
+        
     import multiprocessing
     import platform
-    import scipy
-    import matplotlib
-    import netCDF4
-    import xarray
-    import adios_db
-    adios_version = adios_db.__version__
-    import copernicusmarine
-    copernicus_version = copernicusmarine.__version__
     import sys
     s = '\n------------------------------------------------------\n'
     s += 'Software and hardware:\n'
@@ -142,13 +104,13 @@ def versions():
     s += '  %s GB memory\n' % ram
     s += '  %s processors (%s)\n' % (multiprocessing.cpu_count(),
                                    platform.processor())
-    s += '  NumPy version %s\n' % np.__version__
-    s += '  SciPy version %s\n' % scipy.__version__
-    s += '  Matplotlib version %s\n' % matplotlib.__version__
-    s += '  NetCDF4 version %s\n' % netCDF4.__version__
-    s += '  Xarray version %s\n' % xarray.__version__
-    s += '  ADIOS (adios_db) version %s\n' % adios_version
-    s += '  Copernicusmarine version %s\n' % copernicus_version
+    s += '  NumPy version %s\n' % version('numpy')
+    s += '  SciPy version %s\n' % version('scipy')
+    s += '  Matplotlib version %s\n' % version('matplotlib')
+    s += '  NetCDF4 version %s\n' % version('netCDF4')
+    s += '  Xarray version %s\n' % version('xarray')
+    s += '  ADIOS (adios_db) version %s\n' % version('adios_db')
+    s += '  Copernicusmarine version %s\n' % version('copernicusmarine')
     s += '  Python version %s\n' % sys.version.replace('\n', '')
     s += '------------------------------------------------------\n'
     return s
@@ -217,4 +179,3 @@ def import_from_ladim(ladimfile, romsfile):
     o.steps_output = num_timesteps
 
     return o
-

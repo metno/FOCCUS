@@ -14,6 +14,8 @@
 #
 # Copyright 2015, Knut-Frode Dagestad, MET Norway
 
+import logging; logger = logging.getLogger(__name__)
+import copy
 from collections import OrderedDict
 import numpy as np
 
@@ -49,9 +51,9 @@ class LagrangianArray:
     """
 
     variables = OrderedDict([
-        ('ID', {'dtype': np.int32,  # Unique numerical identifier
-                'seed': False,
-                'default': -1}),  # ID to be assigned by application
+        ('ID', {'dtype': np.int32,  # Unique internal numerical identifier, from 0 to number of elements
+                'seed': False,      # Corresponds to "trajectory" coordinate in self.result
+                'default': -1}),    # To be assigned by seeding methods
         ('status', {'dtype': np.int32,  # Status categories
                     'seed': False,
                     'default': 0}),
@@ -71,12 +73,18 @@ class LagrangianArray:
                  'standard_name': 'longitude',
                  'long_name': 'longitude',
                  'seed': False,
+                 'store_previous_if': (
+                    ('general:coastline_action', 'in', ['stranding', 'previous']), 'or',
+                    ('general:seafloor_action', 'in', ['previous'])),
                  'axis': 'X'}),
         ('lat', {'dtype': np.float32,
                  'units': 'degrees_north',
                  'standard_name': 'latitude',
                  'long_name': 'latitude',
                  'seed': False,
+                 'store_previous_if': (
+                    ('general:coastline_action', 'in', ['stranding', 'previous']), 'or',
+                    ('general:seafloor_action', 'in', ['previous'])),
                  'axis': 'Y'}),
         ('z', {'dtype': np.float32,
                    'units': 'm',
@@ -97,6 +105,8 @@ class LagrangianArray:
             is specified in the OrderedDict 'variables'
             An empty object may be created by giving no input.
         """
+
+        self.variables = copy.deepcopy(self.variables)  # Make self.variables dictionary immutable
 
         # Collect default values in separate dict, for easier access
         default_values = {variable: self.variables[variable]['dtype'](
@@ -121,6 +131,12 @@ class LagrangianArray:
         if redundant_args:
             raise TypeError('Redundant arguments: %s' %
                             str(list(redundant_args)))
+
+        # Ravel any mulitidimensional kwargs
+        for kname in kwargs:
+            if hasattr(kwargs[kname], 'ndim') and kwargs[kname].ndim > 1:
+                logger.debug(f'array {kname} is multidimensional -> flattening with ravel')
+                kwargs[kname] = kwargs[kname].ravel()
 
         # Check that input arrays have same length
         array_lengths = [1]*len(kwargs)

@@ -92,6 +92,10 @@ class ShipDrift(OpenDriftSimulation):
         'land_binary_mask': {'fallback': None},
         'x_sea_water_velocity': {'fallback': None},
         'y_sea_water_velocity': {'fallback': None},
+        # Since the ShipDrift model is deterministic for given ship size,
+        # (in contrast to the Leeway model), we use a default diffusivity
+        # to yield some variability.
+        'horizontal_diffusivity': {'fallback': 100, 'important': False},
         'sea_surface_wave_stokes_drift_x_velocity': {'fallback': 0},
         'sea_surface_wave_stokes_drift_y_velocity': {'fallback': 0},
         'sea_surface_wave_significant_height': {'fallback': 0},
@@ -147,11 +151,6 @@ class ShipDrift(OpenDriftSimulation):
             'level': CONFIG_LEVEL_ESSENTIAL,
             'description': 'If ships are oriented to the left or right of the downwind direction,'
                 'or whether this is unknown. Left/right means that wind will hit ship from backboard/steerboard'}})
-
-        # Since the ShipDrift model is deterministic for given ship size,
-        # (in contrast to the Leeway model), we use a default diffusivity
-        # to yield some variability.
-        self._set_config_default('drift:horizontal_diffusivity', 100)
 
         self._set_config_default('drift:max_speed', 2)
 
@@ -342,45 +341,3 @@ class ShipDrift(OpenDriftSimulation):
         # Stranding
         self.deactivate_elements(self.environment.land_binary_mask == 1,
                                  reason='ship stranded')
-
-    def import_ascii_format(self, filename):
-
-        with open(filename) as f:
-            lines = f.readlines()
-        self.time_step_output, self.time_step = lines[16].split()
-        num_elements = int(lines[25].split()[0])
-        if num_elements != 1:
-            raise ValueError('Import presently only supports single ship')
-        num_timesteps = (len(lines)-30.)/14.
-        num_timesteps = int(num_timesteps)
-
-        # Initialise history array
-        from datetime import datetime, timedelta
-        history_dtype_fields = [
-            (name, self.ElementType.variables[name]['dtype'])
-            for name in self.ElementType.variables]
-        # Add environment variables
-        self.history_metadata = self.ElementType.variables.copy()
-        for env_var in self.required_variables:
-            history_dtype_fields.append((env_var, np.dtype('float32')))
-            self.history_metadata[env_var] = {}
-        history_dtype = np.dtype(history_dtype_fields)
-
-        self.history = np.ma.array(
-	        np.zeros([num_elements, num_timesteps]),
-            dtype=history_dtype, mask=[True])
-
-        self.steps_output = num_timesteps
-        self.steps = num_timesteps
-        self.start_time = datetime.now()
-        self.end_time = datetime.now() + timedelta(hours=1)
-        self.time = self.end_time
-
-        # Read time steps from file
-        for i in range(num_timesteps):
-            line = lines[30 + 14*i + 13]
-            l = line.split()
-            lon = float(l[2])
-            lat = float(l[3])
-            self.history['lon'][0, i] = lon
-            self.history['lat'][0, i] = lat

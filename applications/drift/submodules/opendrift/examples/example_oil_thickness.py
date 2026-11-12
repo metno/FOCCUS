@@ -42,7 +42,7 @@ o1.set_config('processes:update_oilfilm_thickness', True)
 o1.seed_elements(lon=4.5, lat=60, number=number,
                 mass_oil=mass_oil, radius=1000,
                 oil_type=oil_type,
-                time=datetime.utcnow())
+                time=datetime.now())
 o1.run(time_step=timestep, time_step_output=timestep_output,
        duration=duration)
 
@@ -78,7 +78,7 @@ o2.set_config('processes:update_oilfilm_thickness', False)
 o2.seed_elements(lon=4.5, lat=60, number=number,
                 mass_oil=mass_oil, radius=1000,
                 oil_type=oil_type,
-                time=datetime.utcnow())
+                time=datetime.now())
 o2.run(time_step=timestep, time_step_output=timestep_output,
        duration=duration)
 
@@ -110,10 +110,8 @@ plt.show()
 #%%
 # We see that with the updated film thickness,
 # the droplets are getting gradually smaller
-r1 = o1.get_property('diameter')[0]
-r2 = o2.get_property('diameter')[0]
-plt.plot(np.median(r1*1e6, 1))
-plt.plot(np.median(r2*1e6, 1))
+plt.plot(1e6*o1.result.diameter.median(dim='trajectory'))
+plt.plot(1e6*o2.result.diameter.median(dim='trajectory'))
 plt.legend(['With updated film thickness', 'With constant film thickness'])
 plt.xlabel('Time step')
 plt.ylabel('Median droplet diameter  [micrometer]')

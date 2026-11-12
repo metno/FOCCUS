@@ -15,30 +15,45 @@
 # Copyright 2015, Knut-Frode Dagestad, MET Norway
 # Copyright 2020, Gaute Hope, MET Norway
 
+import logging
+logging.captureWarnings(True)
+logger = logging.getLogger('opendrift')
+logging.getLogger('botocore').setLevel(logging.INFO)
+logging.getLogger('urllib3').setLevel(logging.INFO)
+logging.getLogger('PIL').setLevel(logging.INFO)
+logging.getLogger('fiona').setLevel(logging.INFO)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except:
+    logger.debug('Cound not load dotenv')
+
 import sys
 import os
+import copy
 import types
 from typing import Union, List
 import traceback
 import inspect
-import logging
 import psutil
+from importlib.resources import files
 
 from opendrift.models.basemodel.environment import Environment
 from opendrift.readers import reader_global_landmask
 
-logging.captureWarnings(True)
-logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta
-from abc import ABCMeta, abstractmethod, abstractproperty
+from abc import ABCMeta, abstractmethod
 
 import geojson
 import xarray as xr
+import pandas as pd
 import numpy as np
 import scipy
 import pyproj
 import matplotlib
 
+matplotlib.pyplot.set_loglevel(level = 'warning')
 matplotlib.rcParams['legend.numpoints'] = 1
 matplotlib.rcParams['legend.scatterpoints'] = 1
 matplotlib.rcParams['figure.autolayout'] = True
@@ -62,6 +77,61 @@ from roaring_landmask import RoaringLandmask
 
 Mode = Enum('Mode', ['Config', 'Ready', 'Run', 'Result'])
 rl = roaring_landmask.RoaringLandmask.new()
+
+def coastline_crossing(lon1, lat1, lon2, lat2, step_degrees, land_side=True):
+    """Return the coastline crossing points between positions in water (lon1,lat1) and positions on land (lon2, lat2).
+
+    This function uses the RoaringLandmask to find the coastline crossing points,
+    but can be generalised to any landmask later.
+
+    Args:
+        lon1, lat1: Coordinates of first point
+        lon2, lat2: Coordinates of second point
+        precision: Precision for coastline approximation, in degrees
+        land_side: If True, return the last position in water and first position on land.
+
+    Returns:
+        lon, lat
+            Last position in water (if land_side is False) or first position on land (if land_side is True (default)) along transect
+    """
+
+    lon1 = np.atleast_1d(np.asarray(lon1, dtype=float))
+    lat1 = np.atleast_1d(np.asarray(lat1, dtype=float))
+    lon2 = np.atleast_1d(np.asarray(lon2, dtype=float))
+    lat2 = np.atleast_1d(np.asarray(lat2, dtype=float))
+    if land_side is True:
+        lon_c = lon2
+        lat_c = lat2
+    else:
+        lon_c = lon1
+        lat_c = lat1
+    for i, (lon1, lat1, lon2, lat2) in enumerate(zip(lon1, lat1, lon2, lat2)):
+        x_degree_diff = np.abs(lon2 - lon1)
+        y_degree_diff = np.abs(lat2 - lat1)
+        if x_degree_diff == 0 and y_degree_diff == 0:
+            continue
+        if x_degree_diff > 180:  # Crossing dateline
+            if lon1 < 0:
+                lon2 = lon2 - 360
+                x_degree_diff = np.abs(lon2 - lon1)
+            pass
+        # TODO: delta_lon * cos(latitude)
+        x_samples = np.floor(x_degree_diff / step_degrees).astype(np.int64) if x_degree_diff > step_degrees else 1
+        x = np.linspace(lon1, lon2, x_samples)
+        y_samples = np.floor(y_degree_diff/ step_degrees).astype(np.int64) if y_degree_diff > step_degrees else 1
+        y = np.linspace(lat1, lat2, y_samples)
+
+        xx, yy = np.meshgrid(x,y)
+        xx, yy = xx.ravel(), yy.ravel()
+
+        rl_mask = rl.contains_many(xx, yy)
+        if np.any(rl_mask):
+            index = np.argmax(rl_mask)
+            if land_side is False:
+                index = np.maximum(0, index-1)
+            lon_c[i] = xx[index]
+            lat_c[i] = yy[index]
+    return lon_c, lat_c
 
 def require_mode(mode: Union[Mode, List[Mode]], post_next_mode=False, error=None):
     if not isinstance(mode, list):
@@ -201,7 +271,6 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                  seed=0,
                  iomodule='netcdf',
                  loglevel=logging.DEBUG,
-                 logtime='%H:%M:%S',
                  logfile=None):
         """Initialise OpenDriftSimulation
 
@@ -218,27 +287,26 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 `iomodule` is module/filename without preceeding `io_`
             loglevel: set to 0 (default) to retrieve all debug information.
                 Provide a higher value (e.g. 20) to receive less output.
-                Use the string 'custom' to configure logging from outside.
             logtime: if True, a time stamp is given for each logging line.
                      logtime can also be given as a python time specifier
                      (e.g. '%H:%M:%S')
+            logfile:
+                None (default) to send output to console.
+                A string to send output to logfile.
+                Or to get output to both terminal and file:
+                    [<filename.log>, logging.StreamHandler(sys.stdout)]
         """
 
         super().__init__()
 
         self.profiles_depth = None
 
-        self.show_continuous_performance = False
-
         self.origin_marker = None  # Dictionary to store named seeding locations
-
-        self.minvals = {
-        }  # Dicionaries to store minimum and maximum values of variables
-        self.maxvals = {}
 
         # List to store GeoJSON dicts of seeding commands
         self.seed_geojson = []
 
+        self.required_variables = copy.deepcopy(self.required_variables)  # Avoid modifying the class variable
         self.env = Environment(self.required_variables, self._config)
 
         # Make copies of dictionaries so that they are private to each instance
@@ -258,45 +326,42 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         np.random.seed(seed)
 
         self.steps_calculation = 0  # Increase for each simulation step
-        self.steps_output = 0
         self.elements_deactivated = self.ElementType()  # Empty array
         self.elements = self.ElementType()  # Empty array
+        self._elements_previous = None
+        self._environment_previous = None
+        self.elements_previous = None
+        self.environment_previous = None
 
-        if loglevel != 'custom':
-            format = '%(levelname)-7s %(name)s:%(lineno)d: %(message)s'
-            datefmt = None
-            if logtime is not False:
-                format = '%(asctime)s ' + format
-                if logtime is not True:
-                    datefmt = logtime
-            formatter = logging.Formatter(format, datefmt=datefmt)
+        # Set up logging
+        logformat = '%(asctime)s %(levelname)-7s %(name)s:%(lineno)d: %(message)s'
+        datefmt = '%H:%M:%S'
 
-            if loglevel < 10:  # 0 is NOTSET, giving no output
-                loglevel = 10
+        if loglevel < 10:  # 0 is NOTSET, giving no output
+            print('WARNING: from next version (1.14.10), loglevel of 0 will give no logging, please change to 10 for DEBUG')
+            loglevel = 10
+        logger.setLevel(loglevel)
+        logger.handlers.clear()
 
-            od_loggers = [
-                logging.getLogger('opendrift'),
-            ]
+        if logfile is not None:
+            if not isinstance(logfile, list):
+                logfile = [logfile]
+            for lh in logfile:
+                if not isinstance(lh, logging.StreamHandler):
+                    lh = logging.FileHandler(lh, mode='w')
+                lh.setLevel(loglevel)
+                lh.setFormatter(logging.Formatter(logformat, datefmt))
+                logger.addHandler(lh)
+        else:  # logging only to console, with colors
+            import coloredlogs
+            fields = coloredlogs.DEFAULT_FIELD_STYLES
+            fields['levelname']['color'] = 'magenta'
 
-            if logfile is not None:
-                handler = logging.FileHandler(logfile, mode='w')
-                handler.setFormatter(formatter)
-                for l in od_loggers:
-                    l.setLevel(loglevel)
-                    l.handlers = []
-                    l.addHandler(handler)
-            else:
-                import coloredlogs
-                fields = coloredlogs.DEFAULT_FIELD_STYLES
-                fields['levelname']['color'] = 'magenta'
-
-                # coloredlogs does not create duplicate handlers
-                for l in od_loggers:
-                    coloredlogs.install(level=loglevel,
-                                        logger=l,
-                                        fmt=format,
-                                        datefmt=datefmt,
-                                        field_styles=fields)
+            # coloredlogs does not create duplicate handlers
+            coloredlogs.install(level=loglevel,
+                                fmt=logformat,
+                                datefmt=datefmt,
+                                field_styles=fields)
 
         # Prepare outfile
         try:
@@ -305,12 +370,11 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 fromlist=['init', 'write_buffer', 'close', 'import_file'])
         except ImportError:
             logger.info('Could not import iomodule ' + iomodule)
+            raise
         self.io_init = types.MethodType(io_module.init, self)
         self.io_write_buffer = types.MethodType(io_module.write_buffer, self)
         self.io_close = types.MethodType(io_module.close, self)
         self.io_import_file = types.MethodType(io_module.import_file, self)
-        self.io_import_file_xarray = types.MethodType(
-            io_module.import_file_xarray, self)
 
         # Set configuration options
         self._add_config({
@@ -390,15 +454,6 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 'level': CONFIG_LEVEL_ADVANCED,
                 'description': 'Numerical advection scheme for ocean current advection'
             },
-            'drift:horizontal_diffusivity': {
-                'type': 'float',
-                'default': 0,
-                'min': 0,
-                'max': 100000,
-                'units': 'm2/s',
-                'description': 'Add horizontal diffusivity (random walk)',
-                'level': CONFIG_LEVEL_BASIC
-            },
             'drift:profiles_depth': {'type': 'float', 'default': 50, 'min': 0, 'max': None,
                 'level': CONFIG_LEVEL_ADVANCED, 'units': 'meters', 'description':
                 'Environment profiles will be retrieved from surface and down to this depth'},
@@ -473,13 +528,10 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
         # Add default element properties to config
         c = {}
-        for p in self.ElementType.variables:
-            v = self.ElementType.variables[p]
+        for p in self.elements.variables:
+            v = self.elements.variables[p]
             if 'seed' in v and v['seed'] is False:
                 continue  # Properties which may not be provided by user
-            minval = v['min'] if 'min' in v else None
-            maxval = v['max'] if 'max' in v else None
-            units = v['units'] if 'units' in v else None
             c['seed:%s' % p] = {
                 'type': v['type'] if 'type' in v else 'float',
                 'min': v['min'] if 'min' in v else None,
@@ -492,7 +544,9 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             }
         self._add_config(c)
 
-        self.history = None  # Recarray to store trajectories and properties
+        self.result = None  # Xarray Dataset to store trajectories and properties
+        self.index_of_first = None
+        self.index_of_last = None
 
         # Find variables which require profiles
         self.required_profiles = [
@@ -514,15 +568,6 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         self.add_metadata('opendrift_version', opendrift.__version__)
         logger.info('OpenDriftSimulation initialised (version %s)' %
                     opendrift.version.version_or_git())
-
-        # Check if dependencies are outdated
-        import importlib
-        if importlib.util.find_spec("cmocean") is None:
-            logger.warning('#' * 82)
-            logger.warning(
-                'Dependencies are outdated, please update with: conda env update -f environment.yml'
-            )
-            logger.warning('#' * 82)
 
     def clone(self):
         c = self.__class__()
@@ -578,79 +623,75 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         '''Make readers from a file containing list of URLs or paths to netCDF datasets'''
         self.env.add_readers_from_file(*args, **kwargs)
 
+    def default_readers(self):
+        '''Return list of default readers from opendrift.scripts.data_sources.txt'''
+        with open(files('opendrift.scripts').joinpath('data_sources.txt')) as fd:
+            default_readers = fd.readlines()
+        default_readers = [r.strip() for r in default_readers if not r.startswith('#')]
+        return default_readers
+
     # To be overloaded by sublasses, but this parent method must be called
     def prepare_run(self):
         # Copy profile_depth from config
         self.profiles_depth = self.get_config('drift:profiles_depth')
 
-    def store_present_positions(self, IDs=None, lons=None, lats=None):
-        """Store present element positions, in case they shall be moved back"""
-        if self.get_config('general:coastline_action') in ['previous', 'stranding'] or (
-                'general:seafloor_action' in self._config
-                and self.get_config('general:seafloor_action') == 'previous'):
-            if not hasattr(self, 'previous_lon'):
-                self.previous_lon = np.ma.masked_all(self.num_elements_total())
-                self.previous_lat = np.ma.masked_all(self.num_elements_total())
-            if IDs is None:
-                IDs = self.elements.ID
-                lons = self.elements.lon
-                lats = self.elements.lat
-                self.newly_seeded_IDs = None
-            else:
-                # to check if seeded on land
-                if len(IDs) > 0:
-                    self.newly_seeded_IDs = np.copy(IDs)
-                else:
-                    self.newly_seeded_IDs = None
-            self.previous_lon[IDs - 1] = np.copy(lons)
-            self.previous_lat[IDs - 1] = np.copy(lats)
+    # To be overloaded by sublasses, but this parent method must be called
+    def post_run(self):
+        pass
 
-    def store_previous_variables(self):
-        """Store some environment variables, for access at next time step"""
+    def update_previous_state(self):
+        """Store some properties and variables, for access at next time step"""
 
-        if not hasattr(self, 'store_previous'):
-            return
-        if not hasattr(self, 'variables_previous'):
-            # Create ndarray to store previous variables
-            dtype = [(var, np.float32) for var in self.store_previous]
-            self.variables_previous = np.array(np.full(
-                self.num_elements_total(), np.nan),
-                                               dtype=dtype)
+        if self.newly_seeded_IDs is not None:  # For newly seeded elements, we set previous equal to present
+            newly_seeded_rel_indices = np.where(self.elements.age_seconds==self.time_step.total_seconds())[0]
 
-        # Copying variables_previous to environment_previous
-        self.environment_previous = self.variables_previous[self.elements.ID -
-                                                            1]
+        # Environment variables
+        if self._environment_previous is not None:
+            # Update previous environment
+            if self.newly_seeded_IDs is not None:
+                for var in self._environment_previous:
+                    self._environment_previous[var][newly_seeded_rel_indices] = self.environment[var][newly_seeded_rel_indices]
+            self.environment_previous = self._environment_previous.isel(trajectory=self.elements.ID)
+            # Store present environment variables
+            for var in self._environment_previous:
+                self._environment_previous[var][self.elements.ID] = self.environment[var]
 
-        # Use new values for new elements which have no previous value
-        for var in self.store_previous:
-            undefined = np.isnan(self.environment_previous[var])
-            self.environment_previous[var][undefined] = getattr(
-                self.environment, var)[undefined]
+        # Element properties
+        if self._elements_previous is not None:
+            # Update previous elements
+            if self.newly_seeded_IDs is not None:  # For new elements there is no previous, so using present
+                for var in self._elements_previous:
+                    self._elements_previous[var][newly_seeded_rel_indices] = getattr(self.elements, var)[newly_seeded_rel_indices]
+            self.elements_previous = self._elements_previous.isel(trajectory=self.elements.ID)
+            # Store present element properties
+            for var in self._elements_previous:
+                self._elements_previous[var][self.elements.ID] = getattr(self.elements, var)
 
-        self.environment_previous = self.environment_previous.view(np.recarray)
-
-        for var in self.store_previous:
-            self.variables_previous[var][self.elements.ID - 1] = getattr(
-                self.environment, var)
-
-    def interact_with_coastline(self, final=False):
+    def interact_with_coastline(self, final=False, intermediate_simulation=False):
         """Coastline interaction according to configuration setting"""
+
         if self.num_elements_active() == 0:
             return
-        i = self.get_config('general:coastline_action')
-        coastline_approximation_precision = self.get_config('general:coastline_approximation_precision')
-        if not hasattr(self, 'environment') or not hasattr(
-                self.environment, 'land_binary_mask'):
+        if not hasattr(self, 'environment') or not hasattr(self.environment, 'land_binary_mask'):
             return
+
+        i = self.get_config('general:coastline_action')
         if i == 'none':  # Do nothing
             return
+
+        if intermediate_simulation is True:
+            return  # Coastline interaction is left for next simulationstarting from saved output
+
+        coastline_approximation_precision = self.get_config('general:coastline_approximation_precision')
+
         if final is True:  # Get land_binary_mask for final location
             en, en_prof, missing = \
                 self.env.get_environment(['land_binary_mask'],
                                      self.time,
                                      self.elements.lon,
                                      self.elements.lat,
-                                     self.elements.z)
+                                     self.elements.z,
+                                     element_ID = self.elements.ID)
             self.environment.land_binary_mask = en.land_binary_mask
 
         if i == 'stranding':  # Deactivate elements on land, but not in air
@@ -665,46 +706,26 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 (self.environment.land_binary_mask == 1) & (self.elements.z <= 0),
                 reason='stranded'
             )
-            
+
             if not coastline_approximation_precision:
                 return
-            
-            for on_land_id, on_land_prev_id in zip(on_land, self.elements.ID[on_land]):
-                lon = self.elements.lon[on_land_id]
-                lat = self.elements.lat[on_land_id]
-                prev_lon = self.previous_lon[on_land_prev_id - 1]
-                prev_lat = self.previous_lat[on_land_prev_id - 1]
 
-                step_degrees = float(coastline_approximation_precision)
-                
-                x_degree_diff = np.abs(prev_lon - lon)
-                x_samples = np.floor(x_degree_diff / step_degrees).astype(np.int64) if x_degree_diff > step_degrees else 1
-                x = np.linspace(prev_lon, lon, x_samples)
-
-                y_degree_diff = np.abs(prev_lat - lat)
-                y_samples = np.floor(y_degree_diff/ step_degrees).astype(np.int64) if y_degree_diff > step_degrees else 1
-                y = np.linspace(prev_lat, lat, y_samples)
-
-                xx, yy = np.meshgrid(x,y)
-                xx, yy = xx.ravel(), yy.ravel()
-
-                rl_mask = rl.contains_many(xx.ravel(), yy.ravel())
-                if np.any(rl_mask):
-                    index = np.argmax(rl_mask)
-                    new_lon = xx[index]
-                    new_lat = yy[index]
-
-                    self.elements.lon[on_land_id] = new_lon
-                    self.elements.lat[on_land_id] = new_lat
+            self.elements.lon[on_land], self.elements.lat[on_land] = coastline_crossing(
+                self._elements_previous.lon[self.elements.ID][on_land],
+                self._elements_previous.lat[self.elements.ID][on_land],
+                self.elements.lon[on_land],
+                self.elements.lat[on_land],
+                coastline_approximation_precision,
+                land_side=True
+            )
 
             self.environment.land_binary_mask[on_land] = 0
-            
+
         elif i == 'previous':  # Go back to previous position (in water)
             if self.newly_seeded_IDs is not None:
                 self.deactivate_elements(
                     (self.environment.land_binary_mask == 1) &
-                    (self.elements.age_seconds
-                     == self.time_step.total_seconds()),
+                    (self.elements.age_seconds == 0),
                     reason='seeded_on_land')
             on_land = np.where(self.environment.land_binary_mask == 1)[0]
             if len(on_land) == 0:
@@ -713,33 +734,33 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 logger.debug('%s elements hit coastline, '
                              'moving back to water' % len(on_land))
                 on_land_ID = self.elements.ID[on_land]
-                self.elements.lon[on_land] = \
-                    np.copy(self.previous_lon[on_land_ID - 1])
-                self.elements.lat[on_land] = \
-                    np.copy(self.previous_lat[on_land_ID - 1])
+                if not coastline_approximation_precision:
+                    self.elements.lon[on_land] = self._elements_previous.lon[on_land_ID]
+                    self.elements.lat[on_land] = self._elements_previous.lat[on_land_ID]
+                else:
+                    self.elements.lon[on_land], self.elements.lat[on_land] = coastline_crossing(
+                        self._elements_previous.lon[self.elements.ID][on_land],
+                        self._elements_previous.lat[self.elements.ID][on_land],
+                        self.elements.lon[on_land],
+                        self.elements.lat[on_land],
+                        coastline_approximation_precision,
+                        land_side=False
+                    )
                 self.environment.land_binary_mask[on_land] = 0
 
     def interact_with_seafloor(self):
         """Seafloor interaction according to configuration setting"""
+
         if self.num_elements_active() == 0:
             return
         if 'sea_floor_depth_below_sea_level' not in self.env.priority_list:
             return
 
-        if not hasattr(self, 'environment'):
-            logger.warning('Seafloor check not being run because environment is missing. '
-                           'This will happen the first time the function is run but if it happens '
-                           'subsequently there is probably a problem.')
-            return
-
-        if not hasattr(self.environment, 'sea_surface_height'):
-            logger.warning('Seafloor check not being run because sea_surface_height is missing. ')
-            return
-
-        # the shape of these is different than the original arrays
-        # because it is for active drifters
-        sea_floor_depth = self.sea_floor_depth()
-        sea_surface_height = self.sea_surface_height()
+        sea_floor_depth = self.environment.sea_floor_depth_below_sea_level
+        if 'sea_surface_height' in self.required_variables:
+            sea_surface_height = self.environment.sea_surface_height
+        else:
+            sea_surface_height = 0
 
         # Check if any elements are below sea floor
         # But remember that the water column is the sea floor depth + sea surface height
@@ -753,18 +774,16 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         i = self.get_config('general:seafloor_action')
         if i == 'lift_to_seafloor':
             logger.debug('Lifting %s elements to seafloor.' % len(below))
-            self.elements.z[below] = -sea_floor_depth[below]
+            self.elements.z[below] = -(sea_floor_depth + sea_surface_height)[below]
         elif i == 'deactivate':
             self.deactivate_elements(ibelow, reason='seafloor')
-            self.elements.z[below] = -sea_floor_depth[below]
+            self.elements.z[below] = -(sea_floor_depth + sea_surface_height)[below]
         elif i == 'previous':  # Go back to previous position (in water)
             logger.warning('%s elements hit seafloor, '
                            'moving back ' % len(below))
             below_ID = self.elements.ID[below]
-            self.elements.lon[below] = \
-                np.copy(self.previous_lon[below_ID - 1])
-            self.elements.lat[below] = \
-                np.copy(self.previous_lat[below_ID - 1])
+            self.elements.lon[below] = self._elements_previous.lon[below_ID]
+            self.elements.lat[below] = self._elements_previous.lat[below_ID]
 
     @abstractmethod
     def update(self):
@@ -773,15 +792,18 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         update properties (including position) of its particles (self.elements)
         """
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def ElementType(self):
         """Any trajectory model implementation must define an ElementType."""
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def required_variables(self):
         """Any trajectory model implementation must list needed variables."""
 
     def test_data_folder(self):
+        logger.warning('Method test_data_folder() is deprecated. Use instead opendrift.test_data_folder')
         import opendrift
         return os.path.abspath(
             os.path.join(os.path.dirname(opendrift.__file__), '..', 'tests',
@@ -866,10 +888,10 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             self.elements_scheduled_time = np.array(time)
             # We start simulation at time of release of first element:
             self.start_time = time[0]
-            self.elements_scheduled.ID = np.arange(1, len(elements) + 1)
+            self.elements_scheduled.ID = np.arange(0, len(elements))
         else:
-            elements.ID = np.arange(self.num_elements_scheduled() + 1,
-                                    self.num_elements_scheduled() + 1 +
+            elements.ID = np.arange(self.num_elements_scheduled(),
+                                    self.num_elements_scheduled() +
                                     len(elements))  # Increase ID successively
             self.elements_scheduled.extend(elements)
             self.elements_scheduled_time = np.append(
@@ -885,6 +907,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             self.start_time = min_time
             logger.debug('Setting simulation start time to %s' % str(min_time))
 
+        return elements.ID
+
     def release_elements(self):
         """Activate elements which are scheduled within following timestep."""
 
@@ -892,6 +916,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             'to be seeded: %s, already seeded %s' %
             (len(self.elements_scheduled), self.num_elements_activated()))
         if len(self.elements_scheduled) == 0:
+            self.newly_seeded_IDs = None
             return
         if self.time_step.days >= 0:
             indices = (self.elements_scheduled_time >= self.time) & \
@@ -901,23 +926,20 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             indices = (self.elements_scheduled_time <= self.time) & \
                       (self.elements_scheduled_time >
                        self.time + self.time_step)
-        self.store_present_positions(self.elements_scheduled.ID[indices],
-                                     self.elements_scheduled.lon[indices],
-                                     self.elements_scheduled.lat[indices])
+
+        self.newly_seeded_IDs = self.elements_scheduled.ID[indices]  # may be deactivated if on land
+        if self._elements_previous is not None and 'lon' in self._elements_previous:
+            # store position of newly seeded elements
+            self._elements_previous.lon[self.newly_seeded_IDs] = self.elements_scheduled.lon[indices]
+            self._elements_previous.lat[self.newly_seeded_IDs] = self.elements_scheduled.lat[indices]
         self.elements_scheduled.move_elements(self.elements, indices)
         self.elements_scheduled_time = self.elements_scheduled_time[~indices]
         logger.debug('Released %i new elements.' % np.sum(indices))
 
     def closest_ocean_points(self, lon, lat):
         """Return the closest ocean points for given lon, lat"""
+        from opendrift.readers.reader_shape import Reader as ShapeReader
 
-        deltalon = 0.01  # grid
-        deltalat = 0.01
-        numbuffer = 10
-        lonmin = lon.min() - deltalon * numbuffer
-        lonmax = lon.max() + deltalon * numbuffer
-        latmin = lat.min() - deltalat * numbuffer
-        latmax = lat.max() + deltalat * numbuffer
         if not 'land_binary_mask' in self.env.priority_list:
             logger.info('No land reader added, '
                         'making a temporary landmask reader')
@@ -925,7 +947,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             reader_landmask = reader_global_landmask.Reader()
             seed_state = np.random.get_state(
             )  # Do not alter current random number generator
-            o = OceanDrift(loglevel='custom')
+            o = OceanDrift(loglevel=logger.level)
             np.random.set_state(seed_state)
             if hasattr(self, 'simulation_extent'):
                 o.simulation_extent = self.simulation_extent
@@ -933,54 +955,83 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             o.env.finalize()  # This is not env of the main simulation
             land_reader = reader_landmask
         else:
-            logger.info('Using existing reader for land_binary_mask')
+            logger.info('Using existing reader for land_binary_mask to move elements to ocean')
             land_reader_name = self.env.priority_list['land_binary_mask'][0]
             land_reader = self.env.readers[land_reader_name]
             o = self
 
-        land = o.env.get_environment(['land_binary_mask'],
-                                     lon=lon,
-                                     lat=lat,
-                                     z=0 * lon,
-                                     time=land_reader.start_time)[0]['land_binary_mask']
-        if land.max() == 0:
-            logger.info('All points are in ocean')
-            return lon, lat
-        logger.info('Moving %i out of %i points from land to water' %
-                    (np.sum(land != 0), len(lon)))
-        landlons = lon[land != 0]
-        landlats = lat[land != 0]
-        longrid = np.arange(lonmin, lonmax, deltalon)
-        latgrid = np.arange(latmin, latmax, deltalat)
-        longrid, latgrid = np.meshgrid(longrid, latgrid)
-        longrid = longrid.ravel()
-        latgrid = latgrid.ravel()
-        # Remove grid-points not covered by this reader
-        latgrid_covered = land_reader.covers_positions(longrid, latgrid)[0]
-        longrid = longrid[latgrid_covered]
-        latgrid = latgrid[latgrid_covered]
-        landgrid = o.env.get_environment(['land_binary_mask'],
-                                         lon=longrid,
-                                         lat=latgrid,
-                                         z=0 * longrid,
-                                         time=land_reader.start_time)[0]['land_binary_mask']
-        if landgrid.min() == 1 or np.isnan(landgrid.min()):
-            logger.warning('No ocean pixels nearby, cannot move elements.')
-            if land.min() == 1:
-                raise ValueError('All elements seeded on land')
-            return lon, lat
+        if isinstance(land_reader, ShapeReader):
+            # can do this better
+            land_indices = land_reader.get_variables('land_binary_mask', x=lon, y=lat)['land_binary_mask']
+            land_indices = np.where(land_indices==1)[0]
+            lon[land_indices], lat[land_indices], _ = land_reader.get_nearest_outside(
+                lon[land_indices],
+                lat[land_indices],
+                buffer_distance=land_reader._land_kdtree_buffer_distance,
+            )
 
-        oceangridlons = longrid[landgrid == 0]
-        oceangridlats = latgrid[landgrid == 0]
-        tree = scipy.spatial.cKDTree(
-            np.dstack([oceangridlons, oceangridlats])[0])
-        landpoints = np.dstack([landlons, landlats])
-        _dist, indices = tree.query(landpoints)
-        indices = indices.ravel()
-        lon[land != 0] = oceangridlons[indices]
-        lat[land != 0] = oceangridlats[indices]
+        else:
+            deltalon = 0.01  # grid
+            deltalat = 0.01
+            numbuffer = 10
+            lonmin = lon.min() - deltalon * numbuffer
+            lonmax = lon.max() + deltalon * numbuffer
+            latmin = lat.min() - deltalat * numbuffer
+            latmax = lat.max() + deltalat * numbuffer
 
-        return lon, lat
+            land = o.env.get_environment(['land_binary_mask'],
+                                        lon=lon,
+                                        lat=lat,
+                                        z=0 * lon,
+                                        time=land_reader.start_time,
+                                        element_ID=self.elements.ID)[0]['land_binary_mask']
+            land = np.nan_to_num(land, nan=0.0)
+            if land.max() == 0:
+                logger.info('All points are in ocean')
+                return lon, lat, None
+            logger.info('Moving %i out of %i points from land to water' %
+                        (np.sum(land != 0), len(lon)))
+            land_indices = np.where(land != 0)[0]
+            landlons = lon[land_indices]
+            landlats = lat[land_indices]
+            longrid = np.arange(lonmin, lonmax, deltalon)
+            latgrid = np.arange(latmin, latmax, deltalat)
+            if len(longrid) > 1000 or len(latgrid) > 1000:
+                logger.warning(f'Particles cover large area - using coarser resolution for closest ocean point')
+                longrid = np.linspace(lonmin, lonmax, 1000)
+                latgrid = np.linspace(latmin, latmax, 1000)
+            longrid, latgrid = np.meshgrid(longrid, latgrid)
+            longrid = longrid.ravel()
+            latgrid = latgrid.ravel()
+            # Remove grid-points not covered by this reader
+            latgrid_covered = land_reader.covers_positions(longrid, latgrid)[0]
+            longrid = longrid[latgrid_covered]
+            latgrid = latgrid[latgrid_covered]
+            landgrid = o.env.get_environment(['land_binary_mask'],
+                                            lon=longrid,
+                                            lat=latgrid,
+                                            z=0 * longrid,
+                                            time=land_reader.start_time,
+                                            element_ID=self.elements.ID)[0]['land_binary_mask']
+            if landgrid.size == 0:
+                # Need to catch this before trying .min() on it...
+                logger.warning('Land grid has zero size, cannot move elements.')
+                return lon, lat, land_indices
+            if landgrid.min() == 1 or np.isnan(landgrid.min()):
+                logger.warning('No ocean pixels nearby, cannot move elements.')
+                return lon, lat, land_indices
+
+            oceangridlons = longrid[landgrid == 0]
+            oceangridlats = latgrid[landgrid == 0]
+            tree = scipy.spatial.cKDTree(
+                np.dstack([oceangridlons, oceangridlats])[0])
+            landpoints = np.dstack([landlons, landlats])
+            _dist, indices = tree.query(landpoints)
+            indices = indices.ravel()
+            lon[land_indices] = oceangridlons[indices]
+            lat[land_indices] = oceangridlats[indices]
+
+        return lon, lat, land_indices
 
     @require_mode(mode=Mode.Ready)
     def seed_elements(self,
@@ -989,6 +1040,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                       time,
                       radius=0,
                       number=None,
+                      number_per_point=None,
                       radius_type='gaussian',
                       **kwargs):
         """Seed elements with given position(s), time and properties.
@@ -1005,6 +1057,10 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 If number is None, the number of elements is the
                 length of lon/lat or time if these are arrays. Otherwise
                 the number of elements are obtained from the config-default.
+                If provided, number must be a multiple of the number of points.
+            number_per_point: integer, number of particles to be seeded at each point.
+                This shall not be provided along with number.
+                Only relevant if lon/lat are arrays.
             time: datenum or list
                 The time at which particles are seeded/released.
                 If time is a list with two elements, elements are seeded
@@ -1050,6 +1106,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         lat = np.atleast_1d(lat).ravel()
         radius = np.atleast_1d(radius).ravel()
         time = np.atleast_1d(time)
+        time = pd.to_datetime(time).to_pydatetime()
 
         if lat.max() > 90 or lat.min() < -90:
             raise ValueError('Latitude must be between -90 and 90 degrees')
@@ -1058,10 +1115,21 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             raise ValueError('Lon and lat must have same lengths')
 
         if len(lon) > 1:
-            if number is not None and number != len(lon):
-                raise ValueError(
-                    'Lon and lat have length %s, but number is %s' %
-                    (len(lon), number))
+            if number_per_point is not None:
+                if number is not None:
+                    raise ValueError('Both number and number_per_point is provided')
+                number = number_per_point * len(lon)
+            if number is not None:
+                if number % len(lon) == 0:
+                    number_per_point = int(number / len(lon))
+                    if number_per_point > 1:
+                        logger.debug(f'Seeding {number_per_point} elements per point')
+                        lon = np.repeat(lon, number_per_point)
+                        lat = np.repeat(lat, number_per_point)
+                else:
+                    raise ValueError(
+                        'Lon and lat have length %s, but number is %s, which is not a multiple' %
+                        (len(lon), number))
             number = len(lon)
         else:
             if number is None:
@@ -1094,7 +1162,12 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 az = np.random.rand(np.sum(number)) * 360
                 dist = np.sqrt(np.random.uniform(0, 1,
                                                  np.sum(number))) * radius
-            lon, lat, az = geod.fwd(lon, lat, az, dist, radians=False)
+            if len(lon) > 1:
+                lon, lat, az = geod.fwd(lon, lat, az, dist, radians=False)
+            else:
+                lon, lat, az = geod.fwd(lon[0], lat[0], az[0], dist[0], radians=False)
+                lon = np.atleast_1d(lon)
+                lat = np.atleast_1d(lat)
 
         # If z is 'seafloor'
         if not 'z' in kwargs or kwargs['z'] is None:
@@ -1140,10 +1213,32 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             kwargs['z'] = \
                 -env['sea_floor_depth_below_sea_level'].astype('float32') + meters_above_seafloor
 
+        # Getting element properties from seed config, if not specified explicitly
+        seed_config = self.get_configspec('seed:')
+        for seed_prop in seed_config:
+            prop = seed_prop.split(':')[-1]
+            if prop in kwargs:
+                continue
+            if prop in self.ElementType.variables:
+                kwargs[prop] = seed_config[f'seed:{prop}']['value']
+
+        environment = kwargs.pop('environment', None)
+
         # Creating and scheduling elements
         elements = self.ElementType(lon=lon, lat=lat, **kwargs)
         time_array = np.array(time)
-        self.schedule_elements(elements, time)
+        new_element_IDs = self.schedule_elements(elements, time)
+
+        if environment is not None:
+            logger.debug(f'enviroment is provided to seed method, adding constant reader for {environment}')
+            from opendrift.readers.reader_constant import Reader as ConstantReader
+            environment['element_ID'] = new_element_IDs
+            cr = ConstantReader(environment)
+            # Must change mode tomporarily to be allowed to add a new reader
+            tmp_mode = self.mode
+            self.mode = opendrift.models.basemodel.Mode.Config
+            self.add_reader(cr)
+            self.mode = tmp_mode
 
     @require_mode(mode=Mode.Ready)
     def seed_cone(self, lon, lat, time, radius=0, number=None, **kwargs):
@@ -1283,8 +1378,10 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                         datetime.fromisoformat(t[0].replace("Z", "+00:00")),
                         datetime.fromisoformat(t[1].replace("Z", "+00:00"))
                     ]
+                    time = [t.replace(tzinfo=None) for t in time]
                 else:
                     time = datetime.fromisoformat(t.replace("Z", "+00:00"))
+                    time = time.replace(tzinfo=None)
             else:
                 kwargs[prop] = properties[prop]
 
@@ -1354,7 +1451,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
         if total_number is not None:
             additional_elements = total_number - len(lon.ravel())
-            print('Repeating the %d last points, to obtain %d elements' %
+            logger.info('Repeating the %d last points, to obtain %d elements' %
                   (additional_elements, total_number))
             lon = np.concatenate((lon, lon[-additional_elements::]))
             lat = np.concatenate((lat, lat[-additional_elements::]))
@@ -1385,6 +1482,16 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         if number is None:
             number = self.get_config('seed:number')
 
+        lonpoints, latpoints = self.points_within_polygon(lons, lats, number)
+
+        # Finally seed at calculated positions
+        self.seed_elements(lonpoints, latpoints, number=number, **kwargs)
+
+    @staticmethod
+    def points_within_polygon(lons, lats, number):
+        """Return a number of positions (lon, lat) within given polygon.
+
+            Helper method for seed_within_polygon"""
         lons = np.asarray(lons)
         lats = np.asarray(lats)
         if len(lons) < 3:
@@ -1452,161 +1559,81 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             else:
                 break
 
-        # Finally seed at calculated positions
-        self.seed_elements(lonpoints, latpoints, number=number, **kwargs)
+        return lonpoints, latpoints
 
     @require_mode(mode=Mode.Ready)
-    def seed_from_wkt(self, wkt, number=None, **kwargs):
+    def seed_from_wkt(self, wkts, time, **kwargs):
         """Seeds elements within (multi)polygons from WKT"""
-
-        try:
-            from osgeo import ogr, osr
-        except Exception as e:
-            logger.warning(e)
-            raise ValueError('OGR library is needed to parse WKT')
-
-        if number is None:
-            number = self.get_config('seed:number')
-
-        geom = ogr.CreateGeometryFromWkt(wkt)
-        total_area = 0
-        for i in range(0, geom.GetGeometryCount()):
-            g = geom.GetGeometryRef(i)
-            total_area += g.GetArea()
-
-        logger.info('Total area of all polygons: %s m2' % total_area)
-        num_seeded = 0
-        for i in range(0, geom.GetGeometryCount()):
-            g = geom.GetGeometryRef(i)
-            num_elements = int(number * g.GetArea() / total_area)
-            if i == geom.GetGeometryCount() - 1:
-                # For the last feature we seed the remaining number,
-                # avoiding difference due to rounding:
-                num_elements = number - num_seeded
-            logger.info('\tSeeding %s elements within polygon number %s' %
-                        (num_elements, str(i)))
-            try:
-                g.Transform(coordTrans)
-            except:
-                pass
-            b = g.GetBoundary()
-            if b is not None:
-                points = b.GetPoints()
-                lons = [p[0] for p in points]
-                lats = [p[1] for p in points]
-            else:
-                # Alternative if OGR is not built with GEOS support
-                r = g.GetGeometryRef(0)
-                lons = [r.GetX(j) for j in range(r.GetPointCount())]
-                lats = [r.GetY(j) for j in range(r.GetPointCount())]
-
-            self.seed_within_polygon(lons=lons,
-                                     lats=lats,
-                                     number=num_elements,
-                                     **kwargs)
-            num_seeded += num_elements
+        from shapely import wkt
+        import geopandas as gpd  # Local import as this is not a requirement
+        df = pd.DataFrame({'id': [0], 'geometry': wkts})
+        df['geometry'] = df['geometry'].apply(wkt.loads)
+        gdf = gpd.GeoDataFrame(df, geometry='geometry')
+        if gdf.crs is None:
+            gdf = gdf.set_crs(4326, allow_override=True)
+        self.seed_from_geopandas(gdf, time, **kwargs)
 
     @require_mode(mode=Mode.Ready)
     def seed_from_shapefile(self,
                             shapefile,
-                            number,
-                            layername=None,
-                            featurenum=None,
+                            time,
                             **kwargs):
-        """Seeds elements within contours read from a shapefile"""
+        """Seeds elements within polygons of a shapefile"""
 
-        try:
-            from osgeo import ogr, osr
-        except Exception as e:
-            logger.warning(e)
-            raise ValueError('OGR library is needed to read shapefiles.')
+        import geopandas as gpd  # Local import as this is not a requirement
+        geodataframe = gpd.read_file(shapefile)
+        self.seed_from_geopandas(geodataframe, time, **kwargs)
 
-        if 'timeformat' in kwargs:
-            # Recondstructing time from filename, where 'timeformat'
-            # is forwarded to datetime.strptime()
-            kwargs['time'] = datetime.strptime(os.path.basename(shapefile),
-                                               kwargs['timeformat'])
-            del kwargs['timeformat']
+    @require_mode(mode=Mode.Ready)
+    def seed_from_geopandas(self,
+                            geodataframe,
+                            time,
+                            **kwargs):
+        """Seeds elements within polygons of a GeoPandas DataFrame"""
 
-        num_seeded_before = self.num_elements_scheduled()
+        g = geodataframe
 
-        targetSRS = osr.SpatialReference()
-        targetSRS.ImportFromEPSG(4326)
-        try:
-            s = ogr.Open(shapefile)
-        except:
-            s = shapefile
+        geometry_types = g.geom_type.unique()
+        if geometry_types == ['Point']:
+            logger.debug('Geodataframe contains only points, calling seed_elements()')
+            self.seed_elements(lon=g.geometry.x, lat=g.geometry.y, time=time, **kwargs)
+            return
 
-        for layer in s:
-            if layername is not None and layer.GetName() != layername:
-                logger.info('Skipping layer: ' + layer.GetName())
-                continue
-            else:
-                logger.info('Seeding for layer: %s (%s features)' %
-                            (layer.GetDescription(), layer.GetFeatureCount()))
+        # Below only Polygon and Multiplolygon is assumed.
+        # TODO:
+        # - handling of linestring
+        # - raise error if mixture of point, linestring and polygons
 
-            coordTrans = osr.CoordinateTransformation(layer.GetSpatialRef(),
-                                                      targetSRS)
+        if 'number' not in kwargs:
+            number = self.get_config('seed:number')
+        else:
+            number = kwargs.pop('number')
 
-            if featurenum is None:
-                featurenum = range(1, layer.GetFeatureCount() + 1)
-            else:
-                featurenum = np.atleast_1d(featurenum)
-            if max(featurenum) > layer.GetFeatureCount():
-                raise ValueError('Only %s features in layer.' %
-                                 layer.GetFeatureCount())
+        ga = g.to_crs({'proj':'cea'})  # Equal area projection for area calculation
+        g_lonlat = g.to_crs({'proj':'lonlat'})  # Lonlat projection to get lon and lat
 
-            # Loop first through all features to determine total area
-            layer.ResetReading()
-            area_srs = osr.SpatialReference()
-            area_srs.ImportFromEPSG(3857)
-            areaTransform = osr.CoordinateTransformation(
-                layer.GetSpatialRef(), area_srs)
+        areas = np.array([p.area for p in ga.geometry.explode(index_parts=False)])
+        logger.info(f'Seeding {number} elements within {len(areas)} polygons')
 
-            areas = np.zeros(len(featurenum))
-            for i, f in enumerate(featurenum):
-                feature = layer.GetFeature(f - 1)  # Note 1-indexing, not 0
-                if feature is not None:
-                    gom = feature.GetGeometryRef().Clone()
-                    gom.Transform(areaTransform)
-                    areas[i] = gom.GetArea()
+        total_area = np.sum(areas)
+        number_per_polygon = np.array([round(a/total_area*number) for a in areas])
+        # If numbers do not sum to total number, we add/remove 1 particles for the first polygons
+        remaining = int(number - sum(number_per_polygon))
+        if abs(remaining) <= len(number_per_polygon):
+            number_per_polygon[0:abs(remaining)] += np.sign(remaining)
+        elif abs(remaining) > len(number_per_polygon):
+            raise ValueError('Should not happen')
 
-            total_area = np.sum(areas)
-            layer.ResetReading()  # Rewind to first layer
-            logger.info('Total area of all polygons: %s m2' % total_area)
-            # Find number of points per polygon
-            numbers = np.round(number * areas / total_area).astype(int)
-            numbers[numbers.argmax()] += int(number - sum(numbers))
+        all_lons = np.array([])
+        all_lats = np.array([])
+        for e, (n, polygon) in enumerate(zip(number_per_polygon, g_lonlat.geometry.explode(index_parts=False))):
+            logger.info(f'Seeding {n} elements within polygon number {e+1} of area {areas[e]/1e6} km2')
+            lons, lats = polygon.exterior.coords.xy
+            lonpoints, latpoints = self.points_within_polygon(lons, lats, n)
+            all_lons = np.append(all_lons, lonpoints)
+            all_lats = np.append(all_lats, latpoints)
 
-            for i, f in enumerate(featurenum):
-                feature = layer.GetFeature(f - 1)
-                if feature is None:
-                    continue
-                num_elements = numbers[i]
-                geom = feature.GetGeometryRef()
-                logger.info('\tSeeding %s elements within polygon number %s' %
-                            (num_elements, featurenum[i]))
-                try:
-                    geom.Transform(coordTrans)
-                except Exception as e:
-                    logger.warning('Could not transform coordinates:')
-                    logger.warning(e)
-                    pass
-                #b = geom.GetBoundary()
-                #if b is not None:
-                #    points = b.GetPoints()
-                #    lons = [p[0] for p in points]
-                #    lats = [p[1] for p in points]
-                #else:
-                # Alternative if OGR is not built with GEOS support
-                r = geom.GetGeometryRef(0)
-                lons = [r.GetY(j) for j in range(r.GetPointCount())]
-                lats = [r.GetX(j) for j in range(r.GetPointCount())]
-
-                self.seed_within_polygon(lons=lons,
-                                         lats=lats,
-                                         number=num_elements,
-                                         **kwargs)
+        self.seed_elements(lon=all_lons, lat=all_lats, number=number, time=time, **kwargs)
 
     @require_mode(mode=Mode.Ready)
     def seed_letters(self, text, lon, lat, time, number, scale=1.2):
@@ -1654,10 +1681,81 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
         self.schedule_elements(elements, time)
 
+    @require_mode(mode=Mode.Ready)
+    def seed_from_dataset(self, ds, trajectory_time_index=-1, time=None, keep_properties=True, **kwargs):
+        """Seed elements from OpenDrift dataset
+
+         Arguments:
+            ds                      (DataArray)         :   DataArray from previous OpenDrift run.
+            trajectory_time_index   (int)               :   Time index from which to continue OpenDrift run.
+            time                    (datenum or list)   :   Time to initiate particles. If None, uses time from trajectory_time_index.
+            keep_properties         (bool)              :   Keep element properties from DataArray. If False, overrides properties with new ones.
+        """
+        ds = ds.isel(time=trajectory_time_index)
+
+        # get seed time
+        if time is None:
+            time = pd.to_datetime(ds.time.values)
+
+        # Dropping trajectories which had not been initiated at selected time, e.g. for continuous release.
+        ds = ds.where(ds.age_seconds >= 0, drop=True)
+
+        logger.info('Using positions from dataset at time %s' % (str(time)))
+
+        try:
+            file_class = ds.opendrift_class
+            current_class = self.__class__.__name__
+
+            # check if model is the same
+            if file_class != current_class:
+                logger.warning('Current model %s is not equal to model used in provided dataset %s' % (current_class, file_class))
+        except:
+            logger.warning('Could not find opendrift_class in provided dataset')
+
+        if keep_properties:
+            # Making dictionary with previous properties
+            prop_dict = {}
+            for key in self.elements.variables.keys():
+                #omitting lon and lat since these are provided anyways
+                if key == 'lon' or key == 'lat':
+                    pass
+                else:
+                    if key in ds:
+                        prop_dict[key] = ds[key].values
+
+            logger.info('Seeding %i particles from dataset' %(len(ds.lon)))
+            logger.info('Using values from dataset for element properties: ')
+            logger.info('%s' % (str([key for key in prop_dict.keys()])))
+            self.seed_elements(ds.lon, ds.lat, time=time, **prop_dict)
+
+        else:
+            logger.info('Using only lon, lat from provided dataset. Omitting particle properties from previous run')
+            self.seed_elements(ds.lon, ds.lat, time=time, **kwargs)
+
+
+    @require_mode(mode=Mode.Ready)
+    def seed_from_file(self, filename, trajectory_time_index=-1, time=None, keep_properties=True, **kwargs):
+        """Seed elements from OpenDrift output netCDF file
+
+        Arguments:
+            filename                (str)               :   Name of netCDF file with particle positions.
+            trajectory_time_index   (int)               :   Time index from which to continue OpenDrift run.
+            time                    (datenum or list)   :   Time to initiate particles. If None, uses time from trajectory_time_index.
+            keep_properties         (bool)              :   Keep element properties from file. If False, overrides properties with new ones.
+        """
+        logger.info('Seeding elements from previous run in %s' %(filename))
+        ds = xr.open_dataset(filename)
+        self.seed_from_dataset(ds, trajectory_time_index=trajectory_time_index, time=time, keep_properties=keep_properties, **kwargs)
+
     def horizontal_diffusion(self):
         """Move elements with random walk according to given horizontal diffuivity."""
-        D = self.get_config('drift:horizontal_diffusivity')
-        if D == 0:
+        if 'horizontal_diffusivity' not in self.required_variables:
+            logger.debug('No horizontal diffusion')
+            return
+        D = self.environment.horizontal_diffusivity
+        if len(D) == 0:
+            return  # no active elements
+        if D.max() == 0:
             logger.debug('Horizontal diffusivity is 0, no random walk.')
             return
         if self.num_elements_active() == 0:
@@ -1669,9 +1767,12 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         y_vel = self.elements.moving * np.sqrt(2 * D / dt) * np.random.normal(
             scale=1, size=self.num_elements_active())
         speed = np.sqrt(x_vel * x_vel + y_vel * y_vel)
+        if D.min() == D.max():
+            dstring = f'{D.min()}'
+        else:
+            dstring = f'{D.min()} - {D.max()}'
         logger.debug(
-            'Moving elements according to horizontal diffusivity of %s, with speeds between %s and %s m/s'
-            % (D, speed.min(), speed.max()))
+            f'Moving elements according to horizontal diffusivity of {dstring}, with speeds between {speed.min()} and {speed.max()} m/s')
         self.update_positions(x_vel, y_vel)
 
     def deactivate_elements(self, indices, reason='deactivated'):
@@ -1738,7 +1839,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             outfile=None,
             export_variables=None,
             export_buffer_length=100,
-            stop_on_error=False):
+            stop_on_error=False,
+            intermediate_simulation=False):
         """Start a trajectory simulation, after initial configuration.
 
         Performs the main loop:
@@ -1772,6 +1874,9 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 - end_time: datetime object defining the end of the simulation
             export_variables: list of variables and parameter names to be
                 saved to file. Default is None (all variables are saved)
+            intermediate_simulation: if set to True, coastline_interaction is skipped
+                on final time step, to be performed after a new simulation is started
+                from the saved state.
         """
 
         # Exporting software and hardware specification, for possible debugging
@@ -1782,7 +1887,6 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
         if self.num_elements_scheduled() == 0:
             raise ValueError('Please seed elements before starting a run.')
-        self.elements = self.ElementType()
 
         # Export seed_geojson as FeatureCollection string
         self.add_metadata('seed_geojson',
@@ -1796,13 +1900,37 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         # Some cleanup needed if starting from imported state
         if self.steps_calculation >= 1:
             self.steps_calculation = 0
-        if self.history is not None:
-            # Delete history matrix before new run
-            self.history = None
-            # Renumbering elements from 0 to num_elements, necessary fix when
-            # importing from file, where elements may have been deactivated
-            # TODO: should start from 1?
-            self.elements.ID = np.arange(0, self.num_elements_active())
+
+        ###################################################################################
+        # Remove variables from required_variables based on configuration and conditionals
+        ###################################################################################
+        for vn, var in self.required_variables.copy().items():
+            if 'skip_if' in var:
+                skip = evaluate_conditional(*var['skip_if'], self)
+                if skip is True:
+                    logger.info(f'Skipping environment variable {vn} because of condition {var["skip_if"]}')
+                    self.required_variables.pop(vn)
+
+        #########################################################################################
+        # Evaluate conditionals to determine if previous properties or variables shall be stored
+        #########################################################################################
+        # Element properties
+        for en, prop in self.elements.variables.copy().items():
+            if 'store_previous_if' in prop:
+                store = evaluate_conditional(*prop['store_previous_if'], self)
+                if store is True:
+                    logger.info(f'Storing previous values of element property {en} because of condition {prop["store_previous_if"]}')
+                    self.elements.variables[en]['store_previous'] = True
+                del self.elements.variables[en]['store_previous_if']  # To avoid writing this to netCDF metadata
+        # Environment variables
+        for en, var in self.required_variables.copy().items():
+            if 'store_previous_if' in var:
+                store = evaluate_conditional(*var['store_previous_if'], self)
+                if store is True:
+                    logger.info(f'Storing previous values of environment variable {en} because of condition {var["store_previous_if"]}')
+                    self.required_variables[en]['store_previous'] = True
+                del self.required_variables[en]['store_previous_if']  # To avoid writing this to netCDF metadata
+
 
         ########################
         # Simulation time step
@@ -1841,6 +1969,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         ########################
         # Simulation duration
         ########################
+        if hasattr(end_time, 'values'):
+            end_time = pd.Timestamp(end_time.values).to_pydatetime()
         if time_step.days < 0:
             logger.info(
                 'Backwards simulation, starting from last seeded element')
@@ -1875,6 +2005,13 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             raise ValueError(
                 "Time step must be negative if duration is negative.")
 
+        ratio_duration_output = duration/self.time_step_output
+        if not ratio_duration_output.is_integer():
+            initial_duration = duration
+            duration = np.ceil(ratio_duration_output)*self.time_step_output
+            logger.warning('Simulation end is not at an output time step. '
+                           f'Extending duration from {initial_duration} to {duration}')
+
         self.expected_steps_output = duration.total_seconds() / \
             self.time_step_output.total_seconds() + 1  # Includes start and end
         self.expected_steps_calculation = duration.total_seconds() / \
@@ -1894,7 +2031,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             np.radians(np.mean(self.elements_scheduled.lat)))
         # TODO: extent should ideally be a general polygon, not only lon/lat-min/max
         # TODO: Should also take into account eventual lifetime of elements
-        simulation_extent = [
+        simulation_extent = np.array([
             np.maximum(-360,
                        self.elements_scheduled.lon.min() - deltalon),
             np.maximum(-89,
@@ -1903,7 +2040,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                        self.elements_scheduled.lon.max() + deltalon),
             np.minimum(89,
                        self.elements_scheduled.lat.max() + deltalat)
-        ]
+        ])
         if simulation_extent[2] == 360 and simulation_extent[0] < 0:
             simulation_extent[0] = 0
 
@@ -1913,7 +2050,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
         # Store expected simulation extent, to check if new readers have coverage
         self.simulation_extent = simulation_extent
-        self.env.finalize(self.simulation_extent)
+        self.env.finalize(simulation_extent=self.simulation_extent,
+                          start=self.start_time, end=self.expected_end_time)
 
         ####################################################################
         # Preparing history array for storage in memory and eventually file
@@ -1921,7 +2059,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         if export_buffer_length is None:
             self.export_buffer_length = self.expected_steps_output
         else:
-            self.export_buffer_length = export_buffer_length
+            self.export_buffer_length = np.minimum(export_buffer_length, self.expected_steps_output)
 
         if self.time_step.days < 0:
             # For backwards simulation, we start at last seeded element
@@ -1935,41 +2073,85 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             # Forward simulation, start time has been set when seeding
             self.time = self.start_time
 
-        # Add the output variables which are always required
+        # Find variables and element properties for which previous value shall be stored
+        environment_previous = [vn for vn, v in self.required_variables.items()
+                                if v.get('store_previous', False) is True]
+        elements_previous = [vn for vn, v in self.elements.variables.items()
+                             if v.get('store_previous', False) is True]
+
+        # Add the output variables which are always required,
+        # as well as variables for which previous value is stored
         if export_variables is not None:
             export_variables = list(
-                set(export_variables + ['lon', 'lat', 'ID', 'status']))
+                set(export_variables + ['lon', 'lat', 'status'] +
+                    environment_previous + elements_previous))
+
         self.export_variables = export_variables
-        # Initialise array to hold history (element properties and environment)
-        # for export to file.
-        history_dtype_fields = [(name,
-                                 self.ElementType.variables[name]['dtype'])
-                                for name in self.ElementType.variables]
-        # Add environment variables
-        self.history_metadata = self.ElementType.variables.copy()
-        for env_var in self.required_variables:
-            history_dtype_fields.append((env_var, np.dtype('float32')))
-            self.history_metadata[env_var] = {}
 
-        # Remove variables from output array, if only subset is requested
-        if self.export_variables is not None:
-            history_dtype_fields = [
-                f for f in history_dtype_fields
-                if f[0] in self.export_variables
-            ]
-            for m in list(self.history_metadata):
-                if m not in self.export_variables:
-                    del self.history_metadata[m]
+        # Create Xarray Dataset to hold result
+        coords = {  # Initialize for the part fitting in memory
+            'trajectory': ('trajectory', np.arange(len(self.elements_scheduled)),
+                {'cf_role': 'trajectory_id', 'dtype': np.int32}),
+            'time': ('time', pd.date_range(self.start_time, periods=self.export_buffer_length,
+                                           freq=self.time_step_output),
+                     {'standard_name': 'time', 'long_name': 'time', 'dtype': np.float64})}
+        shape = (len(coords['trajectory'][1]), len(coords['time'][1]))
+        dims = ('trajectory', 'time')  # Presently, but shall also allow single dimension
 
-        history_dtype = np.dtype(history_dtype_fields)
-        self.history = np.ma.array(np.zeros(
-            (len(self.elements_scheduled), self.export_buffer_length)),
-                                   dtype=history_dtype)
-        self.history.mask = True
-        self.steps_exported = 0
+        element_vars = {}
+        default_dtype = np.float32  # Allows NaN (in contrast to np.int)
+        for varname, attrs in self.elements.variables.items():
+            if varname == 'ID' or (self.export_variables is not None and
+                                   varname not in self.export_variables):
+                continue
+            attrs = {k:v for k,v in attrs.copy().items() if k not in ['seed', 'default', 'store_previous']}
+            element_vars[varname] = (dims,
+                                     np.full(shape=shape, fill_value=np.nan, dtype=default_dtype),
+                                     attrs)
+
+        environment_vars = {varname: (dims, np.full(shape=shape, fill_value=np.nan, dtype=default_dtype))
+                            for varname,var in self.required_variables.items()
+                            if self.export_variables is None or varname in self.export_variables}
+        global_attributes = {
+            'Conventions': 'CF-1.11, ACDD-1.3',
+            'standard_name_vocabulary': 'CF Standard Name Table v85',
+            'featureType': 'trajectory',
+            'title': 'OpenDrift trajectory simulation',
+            'summary': 'Output from simulation with OpenDrift framework',
+            'keywords': 'trajectory, drift, lagrangian, simulation',
+            'history': 'Created ' + str(datetime.now()),
+            'date_created': datetime.now().isoformat(),
+            'source': 'Output from simulation with OpenDrift',
+            'model_url': 'https://github.com/OpenDrift/opendrift',
+            'opendrift_class': self.__class__.__name__,
+            'opendrift_module': self.__class__.__module__,
+            'readers': str(self.env.readers.keys()),
+            'time_coverage_start': str(self.start_time),
+            'time_step_calculation': str(self.time_step),
+            'time_step_output': str(self.time_step_output),
+            }
+
+        # Add config settings as global attributes
+        for key in self._config:
+            value = self.get_config(key)
+            if isinstance(value, (bool, type(None))):
+                value = str(value)
+            global_attributes['config_' + key] = value
+
+        # TODO: add/remove metadata-dict
+
+        self.result = xr.Dataset(coords=coords, data_vars=element_vars | environment_vars, attrs=global_attributes)
+        logger.debug(f'Initial self.result, size {self.result.sizes}')
+
+        if self.origin_marker is not None and 'origin_marker' in self.result.data_vars:
+            self.result['origin_marker'] = self.result.origin_marker.assign_attrs(
+                {'flag_values': np.arange(len(self.origin_marker)).astype(self.elements.variables['origin_marker']['dtype']),
+                 'flag_meanings': " ".join(self.origin_marker.values())
+                })
 
         if outfile is not None:
             self.io_init(outfile)
+            self.outfile = outfile
         else:
             self.outfile = None
 
@@ -1978,10 +2160,34 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             ('land_binary_mask' in self.required_variables):
             #('land_binary_mask' not in self.fallback_values) and \
             self.timer_start('preparing main loop:moving elements to ocean')
-            self.elements_scheduled.lon, self.elements_scheduled.lat = \
-                self.closest_ocean_points(self.elements_scheduled.lon,
-                                          self.elements_scheduled.lat)
+            # After a restart (seed_from_file / seed_from_dataset / ...), elements seeded from
+            # a previous run must keep their saved lon/lat to preserve their original trajectory.
+
+            # New seeds are identified by age_seconds <= 0 (or missing, non-finite)
+            age = np.asarray(getattr(
+                self.elements_scheduled, 'age_seconds',
+                np.zeros(self.num_elements_scheduled())))
+            newseed = ~np.isfinite(age) | (age <= 0)
+            
+            # Move only newly seeded particles on land to ocean
+            lon = np.array(self.elements_scheduled.lon, copy=True, dtype=float)
+            lat = np.array(self.elements_scheduled.lat, copy=True, dtype=float)
+            orig_lon, orig_lat = lon.copy(), lat.copy()
+            
+            lon, lat, _ = self.closest_ocean_points(lon, lat)
+            if np.any(~newseed):
+                lon[~newseed] = orig_lon[~newseed]
+                lat[~newseed] = orig_lat[~newseed]
+            self.elements_scheduled.lon = lon
+            self.elements_scheduled.lat = lat
             self.timer_end('preparing main loop:moving elements to ocean')
+
+
+        # Make Xarray datasets to store environment variables and element properties from previous time step
+        if len(environment_previous) > 0:
+            self._environment_previous = self.result[[*environment_previous]].isel(time=0, drop=True).copy(deep=True)
+        if len(elements_previous) > 0:
+            self._elements_previous = self.result[[*elements_previous]].isel(time=0, drop=True).copy(deep=True)
 
         #############################
         # Check validity domain
@@ -2015,8 +2221,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 # Release elements
                 self.release_elements()
 
-                if self.num_elements_active(
-                ) == 0 and self.num_elements_scheduled() > 0:
+                # Jump to next timestep if no active elements
+                if self.num_elements_active() == 0 and self.num_elements_scheduled() > 0:
                     logger.info(
                         'No active but %s scheduled elements, skipping timestep %s (%s)'
                         % (self.num_elements_scheduled(),
@@ -2027,12 +2233,6 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                         self.time = self.time + self.time_step
                     continue
 
-                self.increase_age_and_retire()
-
-                self.interact_with_seafloor()
-
-                if self.show_continuous_performance is True:
-                    logger.info(self.performance())
                 # Display time to terminal
                 logger.debug('===================================' * 2)
                 logger.info('%s - step %i of %i - %i active elements '
@@ -2044,29 +2244,22 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 logger.debug('%s elements scheduled.' %
                              self.num_elements_scheduled())
                 logger.debug('===================================' * 2)
-                if len(self.elements.lon) > 0:
-                    lonmin = self.elements.lon.min()
-                    lonmax = self.elements.lon.max()
-                    latmin = self.elements.lat.min()
-                    latmax = self.elements.lat.max()
-                    zmin = self.elements.z.min()
-                    zmax = self.elements.z.max()
-                    if latmin == latmax:
-                        logger.debug('\t\tlatitude =  %s' % (latmin))
-                    else:
-                        logger.debug('\t\t%s <- latitude  -> %s' %
-                                     (latmin, latmax))
-                    if lonmin == lonmax:
-                        logger.debug('\t\tlongitude = %s' % (lonmin))
-                    else:
-                        logger.debug('\t\t%s <- longitude -> %s' %
-                                     (lonmin, lonmax))
-                    if zmin == zmax:
-                        logger.debug('\t\tz = %s' % (zmin))
-                    else:
-                        logger.debug('\t\t%s   <- z ->   %s' % (zmin, zmax))
-                    logger.debug('---------------------------------')
 
+                # Display element locations to terminal
+                for n in ['lat', 'lon', 'z']:
+                    d = getattr(self.elements, n)
+                    dmin = d.min();
+                    dmax = d.max()
+                    n = n.replace('lat', 'latitude').replace('lon', 'longitude')
+                    if dmin == dmax:
+                        logger.debug(f'\t\t{n} = {dmin}')
+                    else:
+                        logger.debug(f'\t\t{dmin} <- {n} -> {dmax}')
+                logger.debug('---------------------------------')
+
+                ###############################################
+                # Get environment data for all active elements
+                ###############################################
                 self.environment, self.environment_profiles, missing = \
                     self.env.get_environment(list(self.required_variables),
                                          self.time,
@@ -2074,59 +2267,46 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                                          self.elements.lat,
                                          self.elements.z,
                                          self.required_profiles,
-                                         self.profiles_depth)
-
-                self.store_previous_variables()
+                                         self.profiles_depth,
+                                         element_ID = self.elements.ID)
 
                 self.calculate_missing_environment_variables()
 
-                if any(missing):
-                    self.report_missing_variables()
+                self.report_missing_variables(missing)
+
+                self.deactivate_outside()
 
                 self.interact_with_coastline()
 
                 self.interact_with_seafloor()
 
-                self.deactivate_elements(missing, reason='missing_data')
-
                 self.state_to_buffer()  # Append status to history array
+
+                self.increase_age_and_retire()
 
                 self.remove_deactivated_elements()
 
-                # Propagate one timestep forwards
-                self.steps_calculation += 1
+                self.update_previous_state()  # Store location, in case elements shall be moved back
 
-                if self.num_elements_active(
-                ) == 0 and self.num_elements_scheduled() == 0:
-                    raise ValueError(
-                        'No more active or scheduled elements, quitting.')
-
-                # Store location, in case elements shall be moved back
-                self.store_present_positions()
-
-                #####################################################
                 if self.num_elements_active() > 0:
+                    ########################################
+                    # Calling module specific update method
+                    ########################################
                     logger.debug('Calling %s.update()' % type(self).__name__)
                     self.timer_start('main loop:updating elements')
                     self.update()
                     self.timer_end('main loop:updating elements')
                 else:
-                    logger.info('No active elements, skipping update() method')
-                #####################################################
+                    if self.num_elements_scheduled() == 0:
+                        raise ValueError('No more active or scheduled elements, quitting.')
+                    else:
+                        logger.info('No active elements, skipping update() method')
 
                 self.horizontal_diffusion()
 
-                if self.num_elements_active(
-                ) == 0 and self.num_elements_scheduled() == 0:
-                    raise ValueError(
-                        'No active or scheduled elements, quitting simulation')
-
-                logger.debug('%s active elements (%s deactivated)' %
-                             (self.num_elements_active(),
-                              self.num_elements_deactivated()))
                 # Updating time
-                if self.time is not None:
-                    self.time = self.time + self.time_step
+                self.time = self.time + self.time_step
+                self.steps_calculation += 1
 
             except Exception as e:
                 message = ('The simulation stopped before requested '
@@ -2152,65 +2332,37 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         self.timer_start('cleaning up')
         logger.debug('Cleaning up')
 
-        self.interact_with_coastline(final=True)
-        self.state_to_buffer()  # Append final status to buffer
-
-        #############################
-        # Add some metadata
-        #############################
-        for var in self.required_variables:
-            keyword = 'reader_' + var
-            if var not in self.env.priority_list:
-                fallback = self.get_config(f'environment:fallback:{var}')
-                if fallback is not None:
-                    self.add_metadata(keyword, fallback)
-                else:
-                    self.add_metadata(keyword, None)
-            else:
-                readers = self.env.priority_list[var]
-                if readers[0].startswith(
-                        'constant_reader') and var in self.env.readers[
-                            readers[0]]._parameter_value_map:
-                    self.add_metadata(
-                        keyword, self.env.readers[
-                            readers[0]]._parameter_value_map[var][0])
-                else:
-                    self.add_metadata(keyword, self.env.priority_list[var])
-
+        self.interact_with_coastline(final=True, intermediate_simulation=intermediate_simulation)
         self.timer_end('cleaning up')
         self.timer_end('total time')
+        self.state_to_buffer(final=True)  # Append final status to buffer
+
+        # Module specific post processing.
+        self.post_run()
+
         if outfile is not None:
-            logger.debug('Writing and closing output file: %s' % outfile)
-            # Write buffer to outfile, and close
-            #if self.steps_output >= self.steps_exported:
-            # KFD: >= changed to > 4th June 2024, as this is probably correct
-            # Unit tests are passing in both cases
-            if self.steps_output > self.steps_exported:
-                # Write last lines, if needed
-                self.io_write_buffer()
+            logger.debug('Finalising and closing output file: %s' % outfile)
             self.io_close()
+        else:
+            if self.num_elements_scheduled() > 0:
+                logger.info(f'Removing {self.num_elements_scheduled()} unseeded elements')
+                seeded_indices = [n for n in np.arange(self.num_elements_total())
+                             if n not in self.elements_scheduled.ID]
+                self.result = self.result.isel(trajectory=seeded_indices)
 
         # Remove any elements scheduled for deactivation during last step
         self.remove_deactivated_elements()
 
         if export_buffer_length is None:
-            # Remove columns for unseeded elements in history array
-            if self.num_elements_scheduled() > 0:
-                logger.info(
-                    'Removing %i unseeded elements from history array' %
-                    self.num_elements_scheduled())
-                mask = np.ones(self.history.shape[0], dtype=bool)
-                mask[self.elements_scheduled.ID - 1] = False
-                self.history = self.history[mask, :]
-
-            # Remove rows for unreached timsteps in history array
-            self.history = self.history[:, range(self.steps_output)]
+            pass  # TODO - do this for self.result
         else:  # If output has been flushed to file during run, we
             # need to reimport from file to get all data in memory
             del self.environment
             if hasattr(self, 'environment_profiles'):
                 del self.environment_profiles
-            self.io_import_file(outfile)
+            self.result = xr.open_dataset(outfile)
+
+        return self.result
 
     def increase_age_and_retire(self):
         """Increase age of elements, and retire if older than config setting."""
@@ -2224,15 +2376,29 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 >= self.get_config('drift:max_age_seconds'),
                 reason='retired')
 
+    def deactivate_outside(self):
         # Deacticate any elements outside validity domain set by user
         if self.validity_domain is not None:
             W, E, S, N = self.validity_domain
+            lon = self.elements.lon
+            if E is not None and E > 180 and np.any(lon < 0):
+                # Elements have crossed the dateline and wrapped to the
+                # native -180..180 convention (lon<0), while E>180 indicates
+                # that drift:deactivate_east_of was given in 0-360 convention.
+                # Convert wrapped longitudes back to 0-360 before comparing
+                # against either boundary, so that the west boundary check
+                # below does not misinterpret wrapped (now negative) values
+                # as having moved too far west.
+                logger.info(
+                    'Some elements have crossed the dateline (lon<0), while '
+                    'drift:deactivate_east_of=%s is given in 0-360 convention. '
+                    'Converting wrapped longitudes to 0-360 convention before '
+                    'checking against deactivate_east_of/west_of.' % E)
+                lon = np.where(lon < 0, lon + 360, lon)
             if W is not None:
-                self.deactivate_elements(self.elements.lon < W,
-                                         reason='outside')
+                self.deactivate_elements(lon < W, reason='outside')
             if E is not None:
-                self.deactivate_elements(self.elements.lon > E,
-                                         reason='outside')
+                self.deactivate_elements(lon > E, reason='outside')
             if S is not None:
                 self.deactivate_elements(self.elements.lat < S,
                                          reason='outside')
@@ -2240,113 +2406,162 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 self.deactivate_elements(self.elements.lat > N,
                                          reason='outside')
 
-    def state_to_buffer(self):
-        """Append present state (elements and environment) to recarray."""
+    def state_to_buffer(self, final=False):
 
-        steps_calculation_float = \
-            (self.steps_calculation * self.time_step.total_seconds() /
-             self.time_step_output.total_seconds()) + 1
-        if self.time_step <= timedelta(seconds=1):
-            self.steps_output = int(np.round(steps_calculation_float))
-        else:
-            self.steps_output = int(np.floor(steps_calculation_float))
-
-        ID_ind = self.elements.ID - 1
-        time_ind = self.steps_output - 1 - self.steps_exported
-        if self.steps_calculation == self.expected_steps_calculation:
-            final_time_step = True
-        else:
-            final_time_step = False
-
-        if steps_calculation_float.is_integer() or self.time_step < timedelta(
-                seconds=1) or final_time_step is True:
-            element_ind = range(len(ID_ind))  # We write all elements
-        else:
+        if pd.to_datetime(self.time) in self.result.time:  # Output time step
+            ID_ind = self.elements.ID
+            element_ind = range(len(ID_ind))
+            insert_time = pd.to_datetime(self.time)
+        else:  # Deactivated elements must be written even if no output timestep
             deactivated = np.where(self.elements.status != 0)[0]
-            if len(deactivated) == 0:
+            if len(deactivated) == 0 and final is False:
                 return  # No deactivated elements this sub-timestep
-            # We write history for deactivated elements only:
-            logger.debug('Writing history for %s deactivated elements' %
-                         len(deactivated))
-            ID_ind = ID_ind[deactivated]
+            ID_ind = self.elements.ID[deactivated]
             element_ind = deactivated
-            time_ind = np.minimum(time_ind + 1, self.history.shape[1] - 1)
+            insert_time = self.result.time.sel(time=self.time, method='backfill').values
 
-        # TODO: storing of variables and environment below should be collected in a single loop
-        # Store present state in history recarray
-        for i, var in enumerate(self.elements.variables):
-            if self.export_variables is not None and \
-                    var not in self.export_variables:
-                continue
-            # Temporarily assuming elements numbered
-            # from 0 to num_elements_active()
-            # Does not hold when importing ID from a saved file, where
-            # some elements have been deactivated
-            self.history[var][ID_ind, time_ind] = \
-                getattr(self.elements, var)[element_ind]
-            if len(ID_ind) > 0:
-                newmin = np.min(self.history[var][ID_ind, time_ind])
-                newmax = np.max(self.history[var][ID_ind, time_ind])
-                if var not in self.minvals:
-                    self.minvals[var] = newmin
-                    self.maxvals[var] = newmax
+        for var in self.result.data_vars:
+            for source in (self.elements, self.environment):
+                d = getattr(source, var, None)
+                if d is not None:
+                    self.result[var].loc[{'time': insert_time,
+                                          'trajectory': ID_ind}] = d[element_ind]
+
+        buffer_is_full = (pd.to_datetime(self.time) == self.result.time[-1]).values
+
+        if final is True or buffer_is_full:
+            logger.debug('Updating minval and maxval')
+            # Update min and max values
+            for varname, var in self.result.data_vars.items():
+                if varname in ['status']:
+                    continue
+                minval = var.min(skipna=True).item()
+                maxval = var.max(skipna=True).item()
+                if 'minval' in var.attrs:
+                    minval = np.minimum(minval, var.minval)
+                    maxval = np.maximum(maxval, var.maxval)
+                # Attributes shall have same datatype as in output file
+                if 'dtype' in var.attrs:
+                    att_type = var.attrs['dtype']
                 else:
-                    self.minvals[var] = np.minimum(self.minvals[var], newmin)
-                    self.maxvals[var] = np.maximum(self.maxvals[var], newmax)
-        # Copy environment data to history array
-        for i, var in enumerate(self.environment.dtype.names):
-            if self.export_variables is not None and \
-                    var not in self.export_variables:
-                continue
-            self.history[var][ID_ind, time_ind] = \
-                getattr(self.environment, var)[element_ind]
-            if len(ID_ind) > 0:
-                newmin = np.min(self.history[var][ID_ind, time_ind])
-                newmax = np.max(self.history[var][ID_ind, time_ind])
-                if var not in self.minvals:
-                    self.minvals[var] = newmin
-                    self.maxvals[var] = newmax
+                    att_type = np.float32
+                minval = att_type(minval)
+                maxval = att_type(maxval)
+                self.result[varname] = self.result[varname].assign_attrs({'minval': minval, 'maxval': maxval})
+
+        if final is True:
+            numtimes_before = self.result.sizes['time']
+            self.result = self.result.sel({'time': slice(self.result.time[0], pd.to_datetime(self.time))})
+            numtimes_after = self.result.sizes['time']
+            if numtimes_after < numtimes_before:
+                logger.debug(f'Truncating buffer from {numtimes_before} to {numtimes_after} times')
+
+            # Final update some variable attributes
+            status_dtype = self.elements.variables['status']['dtype']
+            self.result['status'] = self.result.status.assign_attrs(
+                {'valid_range': np.array((0, len(self.status_categories) - 1)).astype(status_dtype),
+                 'flag_values': np.array(np.arange(len(self.status_categories))).astype(status_dtype),
+                 'flag_meanings': " ".join(self.status_categories)
+                })
+
+            # Add items from metadata_dict
+            for var in self.required_variables:
+                keyword = 'reader_' + var
+                if var not in self.env.priority_list:
+                    fallback = self.get_config(f'environment:fallback:{var}')
+                    if fallback is not None:
+                        self.add_metadata(keyword, fallback)
+                    else:
+                        self.add_metadata(keyword, None)
                 else:
-                    self.minvals[var] = np.minimum(self.minvals[var], newmin)
-                    self.maxvals[var] = np.maximum(self.maxvals[var], newmax)
+                    readers = self.env.priority_list[var]
+                    if readers[0].startswith(
+                            'constant_reader') and var in self.env.readers[
+                                readers[0]]._parameter_value_map:
+                        self.add_metadata(
+                            keyword, self.env.readers[
+                                readers[0]]._parameter_value_map[var][0])
+                    else:
+                        self.add_metadata(keyword, self.env.priority_list[var])
+            self.metadata_dict = {key:str(value) for key,value in self.metadata_dict.items()}
 
-        # Call writer if buffer is full
-        if (self.outfile is not None) and \
-                ((self.steps_output - self.steps_exported) ==
-                    self.export_buffer_length):
-            self.io_write_buffer()
+            final_metadata = {
+                'time_coverage_end': str(self.time),
+                'time_coverage_duration': pd.Timedelta(self.time-self.start_time).isoformat(),
+                'time_coverage_resolution': pd.Timedelta(self.time_step).isoformat(),
+                'performance': self.performance(),
+                'geospatial_bounds_crs': 'EPSG:4326',
+                'geospatial_bounds_vertical_crs': 'EPSG:5831',
+                'geospatial_lat_min': self.result.lat.minval,
+                'geospatial_lat_max': self.result.lat.maxval,
+                'geospatial_lat_units': 'degrees_north',
+                'geospatial_lat_resolution': 'point',
+                'geospatial_lon_min': self.result.lon.minval,
+                'geospatial_lon_max': self.result.lon.maxval,
+                'geospatial_lon_units': 'degrees_east',
+                'geospatial_lon_resolution': 'point',
+                'runtime': str(self.timing['total time'])
+                }
+            if 'z' in self.result.data_vars:
+                final_metadata['geospatial_vertical_min'] = self.result.z.minval
+                final_metadata['geospatial_vertical_max'] = self.result.z.maxval
+                final_metadata['geospatial_vertical_positive'] = 'up'
 
-    def report_missing_variables(self):
-        """Issue warning if some environment variables missing."""
+            self.result = self.result.assign_attrs(self.metadata_dict | final_metadata)
 
-        missing_variables = []
-        for var in self.required_variables:
-            if np.isnan(getattr(self.environment, var).min()):
-                missing_variables.append(var)
+        if final is True or buffer_is_full:
+            logger.debug('Writing to file')
+            if self.outfile is not None:
+                self.io_write_buffer()
+
+        if final is False and buffer_is_full:
+            logger.debug(f'Initialising new buffer')
+            for var in self.result.data_vars:
+                if 'time' in self.result[var].dims:
+                    self.result[var][:] = np.nan
+            newtime = self.result.coords['time'] + pd.Timedelta(self.time_step_output)*self.export_buffer_length
+            self.result.coords['time'] = newtime
+            logger.debug(f'Reset self.result, size {self.result.sizes}')
+
+    def report_missing_variables(self, missing):
+        """Deactivate elements whose environment variables are missing."""
+
+        if not any(missing):
+            return
+
+        missing_variables = [v for v in self.required_variables
+                             if np.any(np.isnan(getattr(self.environment, v)))]
 
         if len(missing_variables) > 0:
             logger.warning('Missing variables: ' + str(missing_variables))
             self.store_message('Missing variables: ' + str(missing_variables))
 
-    def index_of_activation_and_deactivation(self):
+        # TODO: missing should probably be updated after calculating derived variables
+        self.deactivate_elements(missing, reason='missing_data')
+
+    def index_of_first_and_last(self):
         """Return the indices when elements were seeded and deactivated."""
 
-        firstlast = np.ma.notmasked_edges(self.history['lon'], axis=1)
-        index_of_activation = firstlast[0][1]
-        index_of_deactivation = firstlast[1][1]
-        if len(index_of_deactivation) < self.history['lon'].shape[0]:
-            missingind = np.setdiff1d(
-                np.arange(0, self.history['lon'].shape[0]), firstlast[0][0])
-            logger.warning(
-                '%s elements were never seeded, removing from history array (this is probably caused by importing an old file)'
-                % len(missingind))
-            self.history = self.history[firstlast[0][0], :]
+        if self.index_of_first is None:
+            if self.result is not None:
+                index_of_first = self.result.lon.notnull().argmax(dim='time')
+                index_of_last = len(self.result.time) - 1 - self.result.lon.isel(
+                                                time=slice(None, None, -1)).notnull().argmax(dim='time')
+            else:
+                index_of_first = 0
+                index_of_last = 0
+            # Store for later retrieval
+            self.index_of_first = index_of_first
+            self.index_of_last = index_of_last
+        else:  # Retrieved from cache
+            index_of_first = self.index_of_first
+            index_of_last = self.index_of_last
 
-        return index_of_activation, index_of_deactivation
+        return index_of_first, index_of_last
 
     def set_up_map(self,
                    corners=None,
-                   buffer=.1,
+                   buffer='auto',
                    delta_lat=None,
                    lscale=None,
                    fast=False,
@@ -2364,34 +2579,19 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         """
         logger.debug(f"Setting up map: {corners=}, {fast=}, {lscale=}")
 
-        # Initialise map
-        if hasattr(self, 'ds'):  # If dataset is lazily imported
-            lons = self.ds.lon
-            lats = self.ds.lat
-            if not hasattr(self, 'lonmin'):
-                logger.debug('Finding min longitude...')
-                self.lonmin = np.nanmin(self.ds.lon)
-                logger.debug('Finding max longitude...')
-                self.lonmax = np.nanmax(self.ds.lon)
-                logger.debug('Finding min latitude...')
-                self.latmin = np.nanmin(self.ds.lat)
-                logger.debug('Finding max latitude...')
-                self.latmax = np.nanmax(self.ds.lat)
+        if self.result is None:  # To allow plotting of scheduled elements, if simulation not done
+            lons = np.reshape(self.elements_scheduled.lon, (-1, 1))
+            lats = np.reshape(self.elements_scheduled.lat, (-1, 1))
         else:
-            lons, lats = self.get_lonlats()  # TODO: to be removed
+            lons = self.result.lon
+            lats = self.result.lat
 
         if corners is not None:  # User provided map corners
             lonmin = corners[0]
             lonmax = corners[1]
             latmin = corners[2]
             latmax = corners[3]
-        elif hasattr(self, 'lonmin'):  # if dataset is lazily imported
-            lonmin = self.lonmin - buffer * 2
-            lonmax = self.lonmax + buffer * 2
-            latmin = self.latmin - buffer
-            latmax = self.latmax + buffer
         else:
-            lons, lats = self.get_lonlats()
             if 'compare_lonmin' in kwargs:  # checking min/max lon/lat of other simulations
                 lonmin = np.minimum(kwargs['compare_lonmin'], np.nanmin(lons))
                 lonmax = np.maximum(kwargs['compare_lonmax'], np.nanmax(lons))
@@ -2402,6 +2602,9 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 lonmax = np.nanmax(lons)
                 latmin = np.nanmin(lats)
                 latmax = np.nanmax(lats)
+            if buffer == 'auto':
+                buffer_fraction = 0.3  # 30% whitespace, to be updated
+                buffer = np.maximum((lonmax-lonmin)/2, latmax-latmin)*buffer_fraction
             lonmin = lonmin - buffer * 2
             lonmax = lonmax + buffer * 2
             latmin = latmin - buffer
@@ -2419,19 +2622,23 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             globe = ccrs.Globe(ellipse=None,
                                semimajor_axis=axis,
                                semiminor_axis=axis)
-            crs = ccrs.Mercator(globe=globe)
+            self.crs_plot = ccrs.Mercator(globe=globe)
+            self.crs_lonlat = ccrs.PlateCarree(globe=globe)
 
             if lscale is None:
                 lscale = 'c'
         else:
-            crs = ccrs.Mercator()
+            self.crs_plot = ccrs.Mercator()
+            self.crs_lonlat = ccrs.PlateCarree()
+
             if lscale is None:
                 lscale = 'auto'
 
-        globe = crs.globe
-
         meanlat = (latmin + latmax) / 2
-        aspect_ratio = float(latmax - latmin) / (float(lonmax - lonmin))
+        if lonmax == lonmin:
+            aspect_ratio = 1
+        else:
+            aspect_ratio = float(latmax - latmin) / (float(lonmax - lonmin))
         aspect_ratio = aspect_ratio / np.cos(np.radians(meanlat))
         if 'figsize' in kwargs:
             figsize = kwargs['figsize']
@@ -2443,9 +2650,12 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         else:
             fig = plt.figure(figsize=(figsize, figsize * aspect_ratio))
 
-        ax = fig.add_subplot(111, projection=crs)
-        ax.set_extent([lonmin, lonmax, latmin, latmax],
-                      crs=ccrs.PlateCarree(globe=globe))
+        ax = fig.add_subplot(111, projection=self.crs_plot)
+        if lonmin == -180 and lonmax == 180:
+            lonmax -= .1  # To avoid problem with Cartopy
+        ax.set_extent([lonmin, lonmax, latmin, latmax], crs=self.crs_lonlat)
+
+        gl = ax.gridlines(self.crs_lonlat, draw_labels=['left', 'bottom'], xlocs=xlocs, ylocs=ylocs)
 
         if 'ocean_color' in kwargs:
             ax.patch.set_facecolor(kwargs['ocean_color'])
@@ -2459,6 +2669,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 land_color = 'gray'
             else:
                 land_color = cfeature.COLORS['land']
+        land_zorder = kwargs.pop('land_zorder', 1.5)
 
         if 'text' in kwargs:
             if not isinstance(kwargs['text'], list):
@@ -2466,7 +2677,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             else:
                 text = kwargs['text']
             for te in text:
-                plt.text(transform=ccrs.Geodetic(globe=globe), **te)
+                plt.text(transform=self.crs_lonlat, **te)
 
         if 'box' in kwargs:
             if not isinstance(kwargs['box'], list):
@@ -2484,46 +2695,59 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                     plt.text(x=lonmn,
                              y=latmx,
                              s=bx['text'],
-                             transform=ccrs.Geodetic(globe=globe))
+                             transform=self.crs_lonlat)
                     del bx['text']
                 patch = matplotlib.patches.Rectangle(
                     xy=[lonmn, latmn],
                     width=lonmx - lonmn,
                     height=latmx - latmn,
-                    transform=ccrs.Geodetic(globe=globe),
+                    transform=self.crs_lonlat,
                     zorder=10,
                     **bx)
                 ax.add_patch(patch)
+
+        if 'line_plot_options' in kwargs:
+            x = kwargs['line_plot_options'].pop('x')
+            y = kwargs['line_plot_options'].pop('y')
+            plt.plot(x, y, **kwargs['line_plot_options'], transform=self.crs_lonlat)
 
         if not hide_landmask:
             if 'land_binary_mask' in self.env.priority_list and self.env.priority_list[
                     'land_binary_mask'][0] == 'shape':
                 logger.debug('Using custom shapes for plotting land..')
+                if self.env.readers['shape'].invert is True:  # Switching land and ocean colors
+                    facecolor = ocean_color
+                    ax.patch.set_facecolor(land_color)
+                else:
+                    facecolor = land_color
+
                 ax.add_geometries(self.env.readers['shape'].polys,
-                                  ccrs.PlateCarree(globe=globe),
-                                  facecolor=land_color,
+                                  self.crs_lonlat,
+                                  facecolor=facecolor,
                                   edgecolor='black')
             else:
-                reader_global_landmask.plot_land(ax, lonmin, latmin, lonmax,
-                                                 latmax, fast, ocean_color,
-                                                 land_color, lscale, globe)
+                reader_global_landmask.plot_land(ax, lonmin, latmin, lonmax, latmax,
+                                                 fast=fast, ocean_color=ocean_color,
+                                                 land_color=land_color, land_zorder=land_zorder,
+                                                 lscale=lscale,
+                                                 crs_plot=self.crs_plot,
+                                                 crs_lonlat=self.crs_lonlat)
 
-        gl = ax.gridlines(ccrs.PlateCarree(globe=globe), draw_labels=True, xlocs = xlocs, ylocs = ylocs)
-        gl.top_labels = None
+        # Plot contours of seafloor depth
+        if 'contourlines' in kwargs and kwargs['contourlines'] is not None:
+            contourline_variable = kwargs.get('contourline_variable', 'sea_floor_depth_below_sea_level')  # default
+            map_x, map_y, scalar, u_component, v_component = \
+                self.get_map_background(ax, contourline_variable, self.crs_plot, time=self.start_time)
+            if kwargs['contourlines'] is True:
+                CS = ax.contour(map_x, map_y, scalar, colors='gray', transform=self.crs_lonlat)
+            else:
+                CS = ax.contour(map_x, map_y, scalar, levels=kwargs['contourlines'], colors='gray', transform=self.crs_lonlat)
+            plt.clabel(CS)
 
         fig.canvas.draw()
         fig.set_layout_engine('tight')
 
-        if not hasattr(self, 'ds'):
-            try:
-                firstlast = np.ma.notmasked_edges(lons, axis=1)
-                index_of_first = firstlast[0][1]
-                index_of_last = firstlast[1][1]
-            except:
-                index_of_last = 0
-        else:
-            index_of_first = None
-            index_of_last = None
+        index_of_first, index_of_last = self.index_of_first_and_last()
 
         try:  # Activate figure zooming
             mng = plt.get_current_fig_manager()
@@ -2536,25 +2760,12 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         except:
             pass
 
-        return fig, ax, crs, lons.T, lats.T, index_of_first, index_of_last
+        # TODO: avoid transposing lon, lat, and avoid returning lon, lat in the first place
+        return fig, ax, self.crs_plot, lons.T, lats.T, index_of_first, index_of_last
 
-    def get_lonlats(self):
-        if self.history is not None:
-            lons = self.history['lon']
-            lats = self.history['lat']
-        else:
-            if self.steps_output > 0:
-                lons = np.ma.array(np.reshape(self.elements.lon, (1, -1))).T
-                lats = np.ma.array(np.reshape(self.elements.lat, (1, -1))).T
-            else:
-                lons = np.ma.array(
-                    np.reshape(self.elements_scheduled.lon, (1, -1))).T
-                lats = np.ma.array(
-                    np.reshape(self.elements_scheduled.lat, (1, -1))).T
-        return lons, lats
 
     def animation(self,
-                  buffer=.2,
+                  buffer='auto',
                   corners=None,
                   filename=None,
                   compare=None,
@@ -2566,7 +2777,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                   vmax=None,
                   drifter=None,
                   shapefiles=None,
-                  skip=None,
+                  skip='auto',
                   scale=None,
                   color=False,
                   clabel=None,
@@ -2575,6 +2786,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                   density=False,
                   show_elements=True,
                   show_trajectories=False,
+                  linewidth=1,
                   trajectory_alpha=.1,
                   hide_landmask=False,
                   density_pixelsize_m=1000,
@@ -2599,7 +2811,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
         filename = str(filename) if filename is not None else None
 
-        if self.history is not None and self.num_elements_total(
+        if self.result is not None and self.num_elements_total(
         ) == 0 and not hasattr(self, 'ds'):
             raise ValueError('Please run simulation before animating')
 
@@ -2607,6 +2819,40 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             compare_list, compare_args = self._get_comparison_xy_for_plots(
                 compare)
             kwargs.update(compare_args)
+        else:
+            compare_list = []
+
+        # Common time axis (frames) spanning all simulations
+        main_times = self.result.time.values
+        if compare is None:
+            frame_times = main_times
+            main_frame_index = np.arange(len(main_times))
+        else:
+            sims_times = [main_times] + [cd['time_other'] for cd in compare_list]
+            steps = [t[1] - t[0] for t in sims_times if len(t) > 1]
+            frame_step = min(steps)   # finest time step of all simulations
+            frame_times = np.arange(min(t[0] for t in sims_times),
+                                    max(t[-1] for t in sims_times) + frame_step,
+                                    frame_step)
+
+            def _index_on_frames(times):
+                # index into `times` for each frame; -1 outside the simulation period
+                tol = pd.Timedelta(times[1] - times[0] if len(times) > 1
+                                   else frame_step) / 2
+                return pd.Index(times).get_indexer(frame_times,
+                                                   method='nearest',
+                                                   tolerance=tol)
+
+            main_frame_index = _index_on_frames(main_times)
+            for cd in compare_list:
+                cd['frame_index'] = _index_on_frames(cd['time_other'])
+        main_valid = main_frame_index >= 0
+        # Main-simulation index per frame; frozen at first/last step when outside
+        main_index_clipped = np.where(
+            main_valid, main_frame_index,
+            np.where(frame_times < main_times[0], 0, len(main_times) - 1))
+
+        background_zorder = kwargs.pop('background_zorder', 0)
 
         start_time = datetime.now()
         if cmap is None:
@@ -2657,25 +2903,25 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             self.set_up_map(buffer=buffer, corners=corners, lscale=lscale,
                             fast=fast, hide_landmask=hide_landmask, xlocs = xlocs, ylocs = ylocs, **kwargs)
 
-        gcrs = ccrs.PlateCarree(globe=crs.globe)
-
-        def plot_timestep(i):
+        def plot_timestep(frame):
             """Sub function needed for matplotlib animation."""
 
+            i = main_index_clipped[frame]   # index into this simulation
+            time_string = np.datetime_as_string(frame_times[frame], unit='s')
             ret = [points, points_deactivated
                    ]  # list of elements to return for blitting
             if title == 'auto':
-                ax.set_title('%s\n%s UTC' % (self._figure_title(), times[i]))
+                ax.set_title('%s\n%s UTC' % (self._figure_title(), time_string))
             else:
-                ax.set_title('%s\n%s UTC' % (title, times[i]))
+                ax.set_title('%s\n%s UTC' % (title, time_string))
             if background is not None:
                 ret.append(bg)
                 if isinstance(background, xr.DataArray):
                     scalar = background[i, :, :].values
                 else:
                     map_x, map_y, scalar, u_component, v_component = \
-                        self.get_map_background(ax, background, crs,
-                                                time=times[i])
+                        self.get_map_background(ax, background, self.crs_plot,
+                                                time=self.result.time[i])
                 # https://stackoverflow.com/questions/18797175/animation-with-pcolormesh-routine-in-matplotlib-how-do-i-initialize-the-data
                 bg.set_array(scalar.ravel())
                 if type(background) is list:
@@ -2691,7 +2937,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                               vmin=vmin,
                               vmax=vmax,
                               cmap=cmap,
-                              transform=gcrs)
+                              transform=self.crs_lonlat)
 
             if density is True:
                 # Update density plot
@@ -2699,7 +2945,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 ret.append(pm)
 
             # Move points
-            if show_elements is True:
+            if show_elements is True and main_valid[frame]:
                 points.set_offsets(np.c_[x[i, range(x.shape[1])],
                                          y[i, range(x.shape[1])]])
                 points_deactivated.set_offsets(
@@ -2707,24 +2953,25 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                           y_deactive[index_of_last_deactivated < i]])
 
                 if isinstance(markersize, str):
-                    points.set_sizes(markersize_scaling * np.abs(self.history[markersize][:, i]))
-                    #points.set_sizes(markersize_scaling *
-                    #                 np.abs((self.history[markersize][:, i] / self.history[markersize].compressed()[0])))
+                    points.set_sizes(markersize_scaling * np.abs(self.result[markersize][:, i]))
 
                 if color is not False:  # Update colors
                     points.set_array(colorarray[:, i])
                     if compare is not None:
                         for cd in compare_list:
                             cd['points_other'].set_array(colorarray[:, i])
-                    if isinstance(color, str) or hasattr(color, '__len__'):
+                    if (isinstance(color, str) or hasattr(color, '__len__')) and len(index_of_last_deactivated)>0:
                         points_deactivated.set_array(colorarray_deactivated[
                             index_of_last_deactivated < i])
+            elif show_elements is True:
+                points.set_offsets(np.empty((0, 2)))
+                points_deactivated.set_offsets(np.empty((0, 2)))
 
             if drifter is not None:
                 for drnum, dr in enumerate(drifter):
-                    drifter_pos[drnum].set_offsets(np.c_[dr['x'][i],
-                                                         dr['y'][i]])
-                    drifter_line[drnum].set_data(dr['x'][0:i], dr['y'][0:i])
+                    drifter_pos[drnum].set_offsets(np.c_[dr['lon'][frame],
+                                                         dr['lat'][frame]])
+                    drifter_line[drnum].set_data(dr['lon'][0:frame+1], dr['lat'][0:frame+1])
                     ret.append(drifter_line[drnum])
                     ret.append(drifter_pos[drnum])
 
@@ -2733,47 +2980,45 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 for sf in shapefiles:
                     shdf = gpd.read_file(sf)
                     shdf = shdf.to_crs("EPSG:4326")
-                    ax.add_geometries(shdf.geometry, gcrs, edgecolor='g', linewidth=2, facecolor='none')
+                    ax.add_geometries(shdf.geometry, self.crs_lonlat, edgecolor='g', linewidth=2, facecolor='none')
 
-            if show_elements is True:
-                if compare is not None:
-                    for cd in compare_list:
+            if show_elements is True and compare is not None:
+                for cd in compare_list:
+                    j = cd['frame_index'][frame]
+                    if j < 0:   # comparison has no data at this time
+                        cd['points_other'].set_offsets(np.empty((0, 2)))
+                        cd['points_other_deactivated'].set_offsets(np.empty((0, 2)))
+                    else:
                         cd['points_other'].set_offsets(
-                            np.c_[cd['x_other'][range(cd['x_other'].shape[0]),
-                                                i],
-                                  cd['y_other'][range(cd['x_other'].shape[0]),
-                                                i]])
+                            np.c_[cd['x_other'][:, j], cd['y_other'][:, j]])
                         cd['points_other_deactivated'].set_offsets(np.c_[
-                            cd['x_other_deactive'][
-                                cd['index_of_last_deactivated_other'] < i],
-                            cd['y_other_deactive'][
-                                cd['index_of_last_deactivated_other'] < i]])
-                        ret.append(cd['points_other'])
-                        ret.append(cd['points_other_deactivated'])
+                            cd['x_other_deactive'][cd['index_of_last_deactivated_other'] < j],
+                            cd['y_other_deactive'][cd['index_of_last_deactivated_other'] < j]])
+                    ret.append(cd['points_other'])
+                    ret.append(cd['points_other_deactivated'])
 
             return ret
 
         if surface_only is True:
-            z = self.get_property('z')[0]
-            x[z < 0] = np.nan
-            y[z < 0] = np.nan
+            z = self.result.z.T
+            x = x.where(z==0)
+            y = y.where(z==0)
 
         if show_trajectories is True:
-            ax.plot(x, y, color='gray', alpha=trajectory_alpha, transform=gcrs)
+            ax.plot(x, y, color='gray', alpha=trajectory_alpha, transform=self.crs_lonlat, linewidth=linewidth)
 
         if color is not False and show_elements is True:
             if isinstance(color, str):
-                colorarray = self.get_property(color)[0].T
+                colorarray = self.result[color]
                 colorarray = colorarray * unitfactor
                 colorarray_deactivated = \
-                    self.get_property(color)[0][
-                        index_of_last[self.elements_deactivated.ID-1],
-                                      self.elements_deactivated.ID-1].T
+                    self.result[color].T[
+                        index_of_last[self.elements_deactivated.ID],
+                                      self.elements_deactivated.ID]
             elif hasattr(color,
                          '__len__'):  # E.g. array/list of ensemble numbers
-                colorarray_deactivated = color[self.elements_deactivated.ID -
-                                               1]
-                colorarray = np.tile(color, (self.steps_output, 1)).T
+                colorarray_deactivated = color[self.elements_deactivated.ID]
+                colorarray = np.tile(color, (len(self.result.time), 1)).T
             else:
                 colorarray = color
             if vmin is None:
@@ -2788,28 +3033,32 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 map_y, map_x = np.meshgrid(map_y, map_x)
             else:
                 map_x, map_y, scalar, u_component, v_component = \
-                    self.get_map_background(ax, background, crs,
-                                            time=self.start_time)
+                    self.get_map_background(ax, background, self.crs_plot,
+                                            time=self.result.time[0])
             bg = ax.pcolormesh(map_x,
                                map_y,
                                scalar,
                                alpha=bgalpha,
-                               zorder=1,
+                               zorder=background_zorder,
                                antialiased=True,
                                linewidth=0.0,
                                rasterized=True,
                                vmin=vmin,
                                vmax=vmax,
                                cmap=cmap,
-                               transform=gcrs)
+                               transform=self.crs_lonlat)
+            if skip == 'auto':  # We use a suitable number of vectors
+                ny, nx = scalar.shape
+                skip = max(1, max(nx, ny) // 30)
+
             if type(background) is list:
                 bg_quiv = ax.quiver(map_x[::skip, ::skip],
                                     map_y[::skip, ::skip],
                                     u_component[::skip, ::skip],
                                     v_component[::skip, ::skip],
                                     scale=scale,
-                                    zorder=1,
-                                    transform=gcrs)
+                                    zorder=background_zorder,
+                                    transform=self.crs_lonlat)
 
         if lcs is not None:
             if vmin is None:
@@ -2821,48 +3070,48 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                                  vmin=vmin,
                                  vmax=vmax,
                                  cmap=cmap,
-                                 transform=gcrs)
+                                 zorder=background_zorder,
+                                 transform=self.crs_lonlat)
 
-        times = self.get_time_array()[0]
         if show_elements is True:
             index_of_last_deactivated = \
-                index_of_last[self.elements_deactivated.ID-1]
+                index_of_last[self.elements_deactivated.ID]
         if legend is None:
             legend = ['']
 
         if color is False:
-            c = markercolor
+            cargs = {'c': None, 'color': markercolor, 'cmap': None}
+            vmin=None
+            vmax=None
         else:
-            c = []
+            cargs = {'c': [], 'color': None, 'cmap': cmap}
 
         if isinstance(markersize, str):
             if markersize_scaling is None:
                 markersize_scaling = 20
-            markersize_scaling = markersize_scaling / np.abs(self.history[markersize]).max()
+            markersize_scaling = markersize_scaling / np.abs(self.result[markersize]).max()
 
         if isinstance(markersize, str):
             points = ax.scatter([], [],
-                                c=c,
+                                **cargs,
                                 zorder=10,
                                 edgecolor=[],
-                                cmap=cmap,
                                 alpha=alpha,
                                 vmin=vmin,
                                 vmax=vmax,
                                 label=legend[0],
-                                transform=gcrs)
+                                transform=self.crs_lonlat)
         else:
             points = ax.scatter([], [],
-                                c=c,
+                                **cargs,
                                 zorder=10,
                                 edgecolor=[],
-                                cmap=cmap,
                                 alpha=alpha,
                                 s=markersize,
                                 vmin=vmin,
                                 vmax=vmax,
                                 label=legend[0],
-                                transform=gcrs)
+                                transform=self.crs_lonlat)
 
         if (compare is None) and (legend != ['']):
             markers = []
@@ -2885,26 +3134,24 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         # Plot deactivated elements, with transparency
         if isinstance(markersize, str):
             points_deactivated = ax.scatter([], [],
-                                            c=c,
+                                            **cargs,
                                             zorder=9,
                                             vmin=vmin,
                                             vmax=vmax,
                                             s=markersize_scaling,
-                                            cmap=cmap,
                                             edgecolor=[],
                                             alpha=0,
-                                            transform=gcrs)
+                                            transform=self.crs_lonlat)
         else:
             points_deactivated = ax.scatter([], [],
-                                            c=c,
+                                            **cargs,
                                             zorder=9,
                                             vmin=vmin,
                                             vmax=vmax,
                                             s=markersize,
-                                            cmap=cmap,
                                             edgecolor=[],
                                             alpha=.3,
-                                            transform=gcrs)
+                                            transform=self.crs_lonlat)
 
         x_deactive, y_deactive = (self.elements_deactivated.lon,
                                   self.elements_deactivated.lat)
@@ -2916,16 +3163,16 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 else:
                     legstr = None
                 if color is False:
-                    c = self.plot_comparison_colors[cn + 1]
-                else:
-                    c = []
+                    cargs['color'] = self.plot_comparison_colors[cn + 1]
+                #else:
+                #    c = []
                 cd['points_other'] = \
-                    ax.scatter([], [], c=c, marker=compare_marker, cmap=cmap,
-                               s=markersize, label=legstr, zorder=10, transform = gcrs)
+                    ax.scatter([], [], **cargs, marker=compare_marker,
+                               s=markersize, label=legstr, zorder=10, transform = self.crs_lonlat)
                 # Plot deactivated elements, with transparency
                 cd['points_other_deactivated'] = \
-                    ax.scatter([], [], alpha=.3, zorder=9, marker=compare_marker, cmap=cmap,
-                               c=c, s=markersize, transform = gcrs)
+                    ax.scatter([], [], **cargs, alpha=.3, zorder=9, marker=compare_marker,
+                               s=markersize, transform = self.crs_lonlat)
 
             if legend != ['', '']:
                 plt.legend(markerscale=2, loc=legend_loc)
@@ -2942,26 +3189,25 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                                vmin=0.1,
                                vmax=vmax,
                                cmap=cmap,
-                               transform=gcrs)
+                               transform=self.crs_lonlat)
 
         if drifter is not None:
             if not isinstance(drifter, list):
                 drifter = [drifter]
             drifter_pos = [None] * len(drifter)
             drifter_line = [None] * len(drifter)
+            drifter = [d.copy() for d in drifter]  # Avoid modifying original
             for drnum, dr in enumerate(drifter):
                 # Interpolate drifter time series onto simulation times
-                sts = np.array(
-                    [t.total_seconds() for t in np.array(times) - times[0]])
-                dts = np.array([
-                    t.total_seconds() for t in np.array(dr['time']) - times[0]
-                ])
-                dr['x'] = np.interp(sts, dts, dr['lon'])
-                dr['y'] = np.interp(sts, dts, dr['lat'])
-                dr['x'][sts < dts[0]] = np.nan
-                dr['x'][sts > dts[-1]] = np.nan
-                dr['y'][sts < dts[0]] = np.nan
-                dr['y'][sts > dts[-1]] = np.nan
+                sts = (frame_times - frame_times[0]) / np.timedelta64(1, 's')
+                dr_times = np.array(dr['time'], dtype=frame_times.dtype)
+                dts = (dr_times - frame_times[0]) / np.timedelta64(1, 's')
+                dr['lon'] = np.interp(sts, dts, dr['lon'])
+                dr['lat'] = np.interp(sts, dts, dr['lat'])
+                dr['lon'][sts < dts[0]] = np.nan
+                dr['lon'][sts > dts[-1]] = np.nan
+                dr['lat'][sts < dts[0]] = np.nan
+                dr['lat'][sts > dts[-1]] = np.nan
                 dlabel = dr['label'] if 'label' in dr else 'Drifter'
                 dcolor = dr['color'] if 'color' in dr else 'r'
                 dlinewidth = dr['linewidth'] if 'linewidth' in dr else 2
@@ -2972,19 +3218,18 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                                                 zorder=dzorder + 1,
                                                 s=dmarkersize,
                                                 label=dlabel,
-                                                transform=gcrs)
+                                                transform=self.crs_lonlat)
                 drifter_line[drnum] = ax.plot([], [],
                                               color=dcolor,
                                               linewidth=dlinewidth,
                                               zorder=dzorder,
-                                              transform=gcrs)[0]
-                #ax.plot(dr['x'],
-                #        dr['y'],
-                #        color=dcolor,
-                #        linewidth=dlinewidth,
-                #        zorder=dzorder,
-                #        transform=gcrs)
+                                              transform=self.crs_lonlat)[0]
             plt.legend()
+
+        # Set the (two-line) title now, so that tight layout reserves space for it
+        _title = self._figure_title() if title == 'auto' else title
+        ax.set_title('%s\n%s UTC' % (_title,
+                     np.datetime_as_string(frame_times[0], unit='s')))
 
         fig.canvas.draw()
         fig.set_layout_engine('tight')
@@ -3018,10 +3263,25 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                               drawedges=False)
             cb.set_label(clabel)
 
-        frames = x.shape[0] if frames is None else frames
+        # Crop figure exactly to its content (map + labels + title + colorbar)
+        pad_inches = 0.15
+        fig.set_layout_engine('none')
+        fig.canvas.draw()
+        for a in fig.axes:
+            a.apply_aspect()  # make positions reflect the fixed map aspect
+        bb = fig.get_tightbbox(fig.canvas.get_renderer())  # inches
+        W, HE = fig.get_size_inches()
+        newW, newH = bb.width + 2*pad_inches, bb.height + 2*pad_inches
+        for a in fig.axes:
+            p = a.get_position()
+            a.set_position([(p.x0*W - bb.x0 + pad_inches) / newW,
+                            (p.y0*HE - bb.y0 + pad_inches) / newH,
+                            p.width*W/newW,
+                            p.height*HE/newH], which='both')
+        fig.set_size_inches(newW, newH)
+        fig.canvas.draw()
 
-        if compare is not None:
-            frames = min(x.shape[0], cd['x_other'].shape[1])
+        frames = len(frame_times) if frames is None else frames
 
         # blit is now provided to animation()
         #blit = sys.platform != 'darwin'  # blitting does not work on mac os
@@ -3040,6 +3300,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
     def __save_or_plot_animation__(self, figure, plot_timestep, filename,
                                    frames, fps, interval, blit):
 
+        figure.canvas.draw()
+        figure.set_layout_engine('none')
         if filename is not None or 'sphinx_gallery' in sys.modules:
             logger.debug("Saving animation..")
             self.__save_animation__(figure,
@@ -3058,6 +3320,12 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                                            frames=frames,
                                            interval=interval)
             try:
+                __IPYTHON__
+                from IPython.display import display, HTML
+                plt.close()  # prevent showing figure in addition to animation
+                logger.info('Preparing animation for notebook....')
+                display(HTML(anim.to_jshtml()))
+            except NameError:
                 plt.show()
             except AttributeError as e:
                 logger.exception(e)
@@ -3083,7 +3351,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
         def plot_timestep(i):
             """Sub function needed for matplotlib animation."""
-            ax.set_title('%s UTC' % times[i])
+            time_string = np.datetime_as_string(self.result.time[i], unit='s')
+            ax.set_title('%s UTC' % time_string)
             points.set_offsets(np.c_[x[range(x.shape[0]), i], z[range(x.shape[0]), i]])
             if color is not None and compare is None:
                 points.set_array(colorarray[:, i])
@@ -3093,9 +3362,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 z_deactive[index_of_last_deactivated < i]])
 
             if isinstance(markersize, str):
-                points.set_sizes(np.abs(markersize_scaling * self.history[markersize][:, i]))
-                #points.set_sizes(np.abs(markersize_scaling *
-                #            (self.history[markersize][:, i] / self.history[markersize].compressed()[0])))
+                points.set_sizes(np.abs(markersize_scaling * self.result[markersize][:, i]))
 
             if compare is not None:
                 points_other.set_offsets(np.c_[x_other[range(x_other.shape[0]), i],
@@ -3113,32 +3380,32 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             cmap = matplotlib.colormaps[cmap]
         if color is not False:
             if isinstance(color, str):
-                colorarray = self.get_property(color)[0].T
+                colorarray = self.result[color]
                 if vmin is None:
                     vmin = colorarray.min()
                     vmax = colorarray.max()
 
         markercolor = self.plot_comparison_colors[0]
+
         if color is None:
-            c = markercolor
+            cargs = {'c': None, 'color': markercolor, 'cmap': None}
         else:
-            c = []
+            cargs = {'c': [], 'color': None, 'cmap': cmap}
 
         # Set up plot
         index_of_first, index_of_last = \
-            self.index_of_activation_and_deactivation()
-        z = self.get_property('z')[0].T
-        x = self.get_property('lon')[0].T
+            self.index_of_first_and_last()
+        z = self.result.z
+        x = self.result.lon
 
         #seafloor_depth = \
-        #    -self.get_property('sea_floor_depth_below_sea_level')[0].T
+        #    -self.result.sea_floor_depth_below_sea_level
         fig = plt.figure(figsize=(10, 6.))  # Suitable aspect ratio
         ax = fig.gca()
         plt.xlabel('Longitude [degrees]')
         plt.ylabel('Depth [m]')
-        times = self.get_time_array()[0]
         index_of_last_deactivated = \
-            index_of_last[self.elements_deactivated.ID-1]
+            index_of_last[self.elements_deactivated.ID]
         if legend is None:
             if compare is None:
                 legs = ['', '']
@@ -3151,14 +3418,13 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         if isinstance(markersize, str):
             if markersize_scaling is None:
                 markersize_scaling = 20
-            markersize_scaling = markersize_scaling / np.abs(self.history[markersize]).max()
+            markersize_scaling = markersize_scaling / np.abs(self.result[markersize]).max()
 
         points = ax.scatter([], [],
-                            c=c,
+                            **cargs,
                             zorder=10,
                             edgecolor=[],
                             alpha=alpha,
-                            cmap=cmap,
                             s=ms,
                             label=legs[0],
                             vmin=vmin,
@@ -3181,40 +3447,38 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             leg.set_zorder(20)
 
         # Plot deactivated elements, with transparency
-        points_deactivated = ax.scatter([], [], c=[], zorder=10, edgecolor=[],
-                                        cmap=cmap, s=ms, vmin=vmin, vmax=vmax)
+        points_deactivated = ax.scatter([], [], **cargs, zorder=10, edgecolor=[],
+                                        s=ms, vmin=vmin, vmax=vmax)
         x_deactive = self.elements_deactivated.lon
         z_deactive = self.elements_deactivated.z
 
         if compare is not None:
             if type(compare) is str:
                 # Other is given as filename
-                other = self.__class__(loglevel=0)
+                other = self.__class__()
                 other.io_import_file(compare)
             else:
                 # Other is given as an OpenDrift object
                 other = compare
-            z_other = other.get_property('z')[0].T
-            x_other = self.get_property('lon')[0].T
+            z_other = other.result.z
+            x_other = other.result.lon
             points_other = ax.scatter([], [],
-                            c='r',
+                            color='r',
                             zorder=10,
                             alpha=alpha,
                             edgecolor=[],
-                            cmap=cmap,
                             s=markersize,
                             label=legs[1],
                             vmin=vmin,
                             vmax=vmax)
 
             # Plot deactivated elements, with transparency
-            points_other_deactivated = ax.scatter([], [], c='r', cmap=cmap, s=markersize, alpha=.3)
+            points_other_deactivated = ax.scatter([], [], color='r', s=markersize, alpha=.3)
             x_other_deactive = other.elements_deactivated.lon
             z_other_deactive = other.elements_deactivated.z
-            firstlast = np.ma.notmasked_edges(x_other, axis=1)
-            index_of_last_other = firstlast[1][1]
+            index_of_first_other, index_of_last_other = other.index_of_first_and_last()
             index_of_last_deactivated_other = \
-                index_of_last_other[other.elements_deactivated.ID-1]
+                index_of_last_other[other.elements_deactivated.ID]
             xmax = np.maximum(x.max(), x_other.max())
             xmin = np.minimum(x.min(), x_other.min())
             zmax = np.maximum(z.max(), z_other.max())
@@ -3264,27 +3528,28 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             cd = compare_list[cn]  # pointer to dict with data
             if type(comp) is str:
                 # Other is given as filename
-                other = self.__class__(loglevel=0)
+                other = self.__class__()
                 other.io_import_file(comp)
             else:
                 # Other is given as an OpenDrift object
                 other = comp
 
-            lonmin = np.minimum(lonmin, np.nanmin(other.history['lon']))
-            lonmax = np.maximum(lonmax, np.nanmax(other.history['lon']))
-            latmin = np.minimum(latmin, np.nanmin(other.history['lat']))
-            latmax = np.maximum(latmax, np.nanmax(other.history['lat']))
+            lonmin = np.minimum(lonmin, other.result.lon.min())
+            lonmax = np.maximum(lonmax, other.result.lon.max())
+            latmin = np.minimum(latmin, other.result.lat.min())
+            latmax = np.maximum(latmax, other.result.lat.max())
 
             # Find map coordinates of comparison simulations
-            cd['x_other'], cd['y_other'] = \
-                (other.history['lon'].copy(), other.history['lat'].copy())
+            cd['dataset'] = other.result
+            cd['time_other'] = other.result.time.values
+            cd['x_other'] = other.result.lon.copy()
+            cd['y_other'] = other.result.lat.copy()
             cd['x_other_deactive'], cd['y_other_deactive'] = \
                 (other.elements_deactivated.lon.copy(),
                     other.elements_deactivated.lat.copy())
-            cd['firstlast'] = np.ma.notmasked_edges(cd['x_other'], axis=1)
-            cd['index_of_last_other'] = cd['firstlast'][1][1]
+            cd['index_of_last_other'] = other.index_of_first_and_last()[1]
             cd['index_of_last_deactivated_other'] = \
-                cd['index_of_last_other'][other.elements_deactivated.ID-1]
+                cd['index_of_last_other'][other.elements_deactivated.ID]
 
         compare_args = {
             'compare_lonmin': lonmin,
@@ -3297,7 +3562,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
     def plot(self,
              background=None,
-             buffer=.2,
+             buffer='auto',
              corners=None,
              linecolor=None,
              filename=None,
@@ -3311,7 +3576,6 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
              skip=None,
              scale=None,
              show_scalar=True,
-             contourlines=False,
              drifter=None,
              colorbar=True,
              linewidth=1,
@@ -3319,9 +3583,10 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
              show_elements=True,
              show_trajectories=True,
              show_initial=True,
+             convex_hull=False,
              density_pixelsize_m=1000,
              lalpha=None,
-             bgalpha=1,
+             bgalpha=.8,
              clabel=None,
              cpad=.05,
              caspect=30,
@@ -3375,22 +3640,30 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
         mappable = None
 
-        if self.history is not None and self.num_elements_total(
+        if self.result is not None and self.num_elements_total(
         ) == 0 and not hasattr(self, 'ds'):
             raise ValueError('Please run simulation before animating')
 
         start_time = datetime.now()
 
+        if self.result is not None:
+            period_start = self.result.time.values[0]
+            period_end = self.result.time.values[-1]
         if compare is not None:
             # Extend map coverage to cover comparison simulations
             cd, compare_args = self._get_comparison_xy_for_plots(compare)
             kwargs.update(compare_args)
+            for c in cd:
+                period_start = min(period_start, c['time_other'][0])
+                period_end = max(period_end, c['time_other'][-1])
 
         if drifter is not None:
+            if isinstance(drifter, xr.Dataset):  # Temporary - should use TrajAn
+                drifter = {'time': drifter.time.squeeze(), 'lon': drifter.lon.squeeze(), 'lat': drifter.lat.squeeze()}
             # Extend map coverage to cover provided trajectory
             # TODO: drifter should be list of dictionaries
-            ttime = np.array(drifter['time'])
-            i = np.where((ttime >= self.start_time) & (ttime <= self.time))[0]
+            ttime = np.array(drifter['time'], dtype=self.result.time.dtype)
+            i = np.where((ttime >= period_start) & (ttime <= period_end))[0]
             drifter['lon'] = np.atleast_1d(drifter['lon'])
             drifter['lat'] = np.atleast_1d(drifter['lat'])
             tlonmin = drifter['lon'][i].min()
@@ -3415,9 +3688,6 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         fig, ax, crs, x, y, index_of_first, index_of_last = \
             self.set_up_map(buffer=buffer, corners=corners, lscale=lscale, fast=fast, hide_landmask=hide_landmask, xlocs = xlocs, ylocs = ylocs, **kwargs)
 
-        # x, y are longitude, latitude -> i.e. in a PlateCarree CRS
-        gcrs = ccrs.PlateCarree(globe=crs.globe)
-
         markercolor = self.plot_comparison_colors[0]
 
         # The more elements, the more transparent we make the lines
@@ -3431,7 +3701,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             alpha = lalpha  #  provided transparency of trajectories
         if legend is False:
             legend = None
-        if self.history is not None and linewidth != 0 and show_trajectories is True:
+        if self.result is not None and linewidth != 0 and show_trajectories is True:
             # Plot trajectories
             from matplotlib.colors import is_color_like
             if linecolor is None or is_color_like(linecolor) is True:
@@ -3441,8 +3711,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                     linecolor = 'gray'
                 if compare is not None and legend is not None:
                     if legend is True:
-                        if hasattr(compare, 'len'):
-                            numleg = len(compare)
+                        if hasattr(compare, '__len__'):
+                            numleg = len(compare) + 1
                         else:
                             numleg = 2
                         legend = [
@@ -3454,35 +3724,40 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                             alpha=alpha,
                             label=legend[0],
                             linewidth=linewidth,
-                            transform=gcrs)
+                            transform=self.crs_lonlat)
                     ax.plot(x,
                             y,
                             color=linecolor,
                             alpha=alpha,
                             label='_nolegend_',
                             linewidth=linewidth,
-                            transform=gcrs)
+                            transform=self.crs_lonlat)
+                    if convex_hull is True:
+                        self.result.isel(time=-1).traj.plot.convex_hull(color=linecolor)
                 else:
-                    ax.plot(x,
-                            y,
-                            color=linecolor,
-                            alpha=alpha,
-                            linewidth=linewidth,
-                            transform=gcrs)
+                    with np.errstate(invalid="ignore"):
+                        ax.plot(x,
+                                y,
+                                color=linecolor,
+                                alpha=alpha,
+                                linewidth=linewidth,
+                                transform=self.crs_lonlat)
+                    if convex_hull is True:
+                        self.result.isel(time=-1).traj.plot.convex_hull(color=linecolor)
             else:
                 #colorbar = True
                 # Color lines according to given parameter
                 try:
                     if isinstance(linecolor, str):
-                        param = self.history[linecolor]
+                        param = self.result[linecolor]
                     elif hasattr(linecolor, '__len__'):
-                        param = np.tile(linecolor, (self.steps_output, 1)).T
+                        param = np.tile(linecolor, (len(self.result.time), 1)).T
                     else:
                         param = linecolor
                 except:
                     raise ValueError(
                         'Available parameters to be used for linecolors: ' +
-                        str(self.history.dtype.fields))
+                        str(self.result.data_vars))
                 from matplotlib.collections import LineCollection
                 for i in range(x.shape[1]):
                     vind = np.arange(index_of_first[i], index_of_last[i] + 1)
@@ -3498,7 +3773,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                         #cmap=plt.colormaps['Spectral'],
                         cmap=cmap,
                         norm=plt.Normalize(lvmin, lvmax),
-                        transform=gcrs)
+                        transform=self.crs_lonlat)
                     #lc.set_linewidth(3)
                     lc.set_array(param.T[vind, i])
                     mappable = ax.add_collection(lc)
@@ -3521,7 +3796,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         else:
             label_initial = None
             label_active = None
-            color_initial = 'gray'
+            color_initial = self.status_colors['initial']
             color_active = 'gray'
         if show_elements is True:
             if show_initial is True:
@@ -3531,9 +3806,9 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                            zorder=10,
                            edgecolor=markercolor,
                            linewidths=.2,
-                           c=color_initial,
+                           color=color_initial,
                            label=label_initial,
-                           transform=gcrs)
+                           transform=self.crs_lonlat)
             if surface_color is not None:
                 color_active = surface_color
                 label_active = 'surface'
@@ -3543,9 +3818,9 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                        zorder=3,
                        edgecolor=markercolor,
                        linewidths=.2,
-                       c=color_active,
+                       color=color_active,
                        label=label_active,
-                       transform=gcrs)
+                       transform=self.crs_lonlat)
             #if submerged_color is not None:
             #    map.scatter(x[range(x.shape[0]), index_of_last],
             #                y[range(x.shape[0]), index_of_last], s=markersize,
@@ -3589,9 +3864,9 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                                zorder=zorder,
                                edgecolor=markercolor,
                                linewidths=.1,
-                               c=color_status,
+                               color=color_status,
                                label=legstr,
-                               transform=gcrs)
+                               transform=self.crs_lonlat)
 
         if compare is not None:
             for i, c in enumerate(cd):
@@ -3605,14 +3880,15 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                         linestyle='-',
                         label=legstr,
                         linewidth=linewidth,
-                        transform=gcrs)
+                        transform=self.crs_lonlat)
                 ax.plot(c['x_other'].T,
                         c['y_other'].T,
                         color=self.plot_comparison_colors[i + 1],
+                        alpha=alpha,
                         linestyle='-',
                         label='_nolegend_',
                         linewidth=linewidth,
-                        transform=gcrs)
+                        transform=self.crs_lonlat)
                 ax.scatter(c['x_other'][range(c['x_other'].shape[0]),
                                         c['index_of_last_other']],
                            c['y_other'][range(c['y_other'].shape[0]),
@@ -3621,18 +3897,26 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                            zorder=3,
                            edgecolor=markercolor,
                            linewidths=.2,
-                           c=self.plot_comparison_colors[i + 1],
-                           transform=gcrs)
+                           color=self.plot_comparison_colors[i + 1],
+                           transform=self.crs_lonlat)
+                if convex_hull is True:
+                    c['dataset'].isel(time=-1).traj.plot.convex_hull(color=self.plot_comparison_colors[i + 1])
 
+        background_zorder = kwargs.pop('background_zorder', 0)
         if background is not None:
             if hasattr(self, 'time'):
                 time = self.time - self.time_step_output
             else:
                 time = None
             if isinstance(background, xr.DataArray):
-                map_x = background.coords['lon_bin']
-                map_y = background.coords['lat_bin']
-                scalar = background
+                if 'lon' in background.coords:  # From TrajAn
+                    map_x = background.coords['lon']
+                    map_y = background.coords['lat']
+                    scalar = background.T
+                else:  # From get_density_array
+                    map_x = background.coords['lon_bin']
+                    map_y = background.coords['lat_bin']
+                    scalar = background
                 map_y, map_x = np.meshgrid(map_y, map_x)
             elif background == 'residence':
                 scalar, lon_res, lat_res = self.get_residence_time(
@@ -3648,33 +3932,16 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 #self.time_step_output)
 
             if show_scalar is True:
-                if contourlines is False:
-                    scalar = np.ma.masked_invalid(scalar)
-                    mappable = ax.pcolormesh(map_x,
-                                             map_y,
-                                             scalar,
-                                             alpha=bgalpha,
-                                             zorder=1,
-                                             vmin=vmin,
-                                             vmax=vmax,
-                                             cmap=cmap,
-                                             transform=gcrs)
-                else:
-                    if contourlines is True:
-                        CS = ax.contour(map_x,
-                                        map_y,
-                                        scalar,
-                                        colors='gray',
-                                        transform=gcrs)
-                    else:
-                        # contourlines is an array of values
-                        CS = ax.contour(map_x,
-                                        map_y,
-                                        scalar,
-                                        contourlines,
-                                        colors='gray',
-                                        transform=gcrs)
-                    plt.clabel(CS, fmt='%g')
+                scalar = np.ma.masked_invalid(scalar)
+                mappable = ax.pcolormesh(map_x,
+                                            map_y,
+                                            scalar,
+                                            alpha=bgalpha,
+                                            zorder=background_zorder,
+                                            vmin=vmin,
+                                            vmax=vmax,
+                                            cmap=cmap,
+                                            transform=self.crs_lonlat)
 
         if mappable is not None and colorbar is True:
             cb = fig.colorbar(mappable,
@@ -3700,8 +3967,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                       u_component[::skip, ::skip],
                       v_component[::skip, ::skip],
                       scale=scale,
-                      transform=gcrs,
-                      zorder=1)
+                      transform=self.crs_lonlat,
+                      zorder=background_zorder)
 
         if lcs is not None:
             map_x_lcs, map_y_lcs = (lcs['lon'], lcs['lat'])
@@ -3711,9 +3978,9 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                           alpha=1,
                           vmin=vmin,
                           vmax=vmax,
-                          zorder=0,
+                          zorder=background_zorder,
                           cmap=cmap,
-                          transform=gcrs)
+                          transform=self.crs_lonlat)
 
         if title is not None:
             if title == 'auto':
@@ -3722,7 +3989,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                               (self._figure_title(),
                                self.start_time.strftime('%Y-%m-%d %H:%M'),
                                self.time.strftime('%Y-%m-%d %H:%M'),
-                               self.steps_output))
+                               len(self.result.time)))
                 else:
                     plt.title(
                         '%s\n%i elements seeded at %s UTC' %
@@ -3733,7 +4000,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 plt.title(title)
 
         if drifter is not None:
-            self._plot_drifter(ax, gcrs, drifter)
+            self._plot_drifter(ax, self.crs_lonlat, drifter,
+                               period=(period_start, period_end))
 
         try:
             handles, labels = ax.get_legend_handles_labels()
@@ -3765,41 +4033,51 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             return 'OpenDrift - ' + type(
                 self).__name__ + ' (%s)' % self._substance_name()
 
-    def _plot_drifter(self, ax, gcrs, drifter):
+    def _plot_drifter(self, ax, gcrs, drifter, period=None):
         '''Plot provided trajectory along with simulated'''
-        time = drifter['time']
-        time = np.array(time)
-        i = np.where((time >= self.start_time) & (time <= self.time))[0]
-        x, y = (np.atleast_1d(drifter['lon'])[i],
-                np.atleast_1d(drifter['lat'])[i])
+        time = np.array(drifter['time'], dtype=self.result.time.dtype)
+        if period is None:  # default: period of this simulation only
+            period = (self.result.time.values[0], self.result.time.values[-1])
+        i = np.where((time >= period[0]) & (time <= period[1]))[0]
+        lon, lat = (np.atleast_1d(drifter['lon'])[i],
+                    np.atleast_1d(drifter['lat'])[i])
         dlabel = drifter['label'] if 'label' in drifter else 'Drifter'
         dcolor = drifter['color'] if 'color' in drifter else 'r'
         dlinewidth = drifter['linewidth'] if 'linewidth' in drifter else 2
         dzorder = drifter['zorder'] if 'zorder' in drifter else 10
 
-        ax.plot(x,
-                y,
+        ax.plot(lon,
+                lat,
                 linewidth=dlinewidth,
                 color=dcolor,
-                transform=gcrs,
+                transform=self.crs_lonlat,
                 label=dlabel,
                 zorder=dzorder)
-        ax.plot(x[0], y[0], 'ok', transform=gcrs)
-        ax.plot(x[-1], y[-1], 'xk', transform=gcrs)
+        ax.plot(lon[0], lat[0], 'ok', transform=self.crs_lonlat)
+        ax.plot(lon[-1], lat[-1], 'xk', transform=self.crs_lonlat)
 
     def get_map_background(self, ax, background, crs, time=None):
         # Get background field for plotting on map or animation
         # TODO: this method should be made more robust
+        if time is not None:
+            if isinstance(time, xr.DataArray):
+                time = pd.to_datetime(time.data)
+            elif isinstance(time, datetime):
+                time = pd.to_datetime(time)
+
         if type(background) is list:
             variable = background[0]  # A vector is requested
         else:
             variable = background  # A scalar is requested
-        for readerName in self.env.readers:
+        readers = self.env.priority_list[variable] + list(self.env.readers)
+        for readerName in readers:
+            if readerName == 'global_landmask':
+                continue  # Not suitable for background field
             reader = self.env.readers[readerName]
             if variable in reader.variables:
                 if time is None or reader.start_time is None or (
-                        time >= reader.start_time
-                        and time <= reader.end_time) or (reader.always_valid
+                        time >= pd.Timestamp(reader.start_time)
+                        and time <= pd.Timestamp(reader.end_time)) or (reader.always_valid
                                                          is True):
                     break
         if time is None:
@@ -3809,8 +4087,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
         # Get reader coordinates covering given map area
         axisproj = pyproj.Proj(ax.projection.proj4_params)
-        xmin, xmax, ymin, ymax = ax.get_extent(
-            ccrs.PlateCarree(globe=crs.globe))
+        xmin, xmax, ymin, ymax = ax.get_extent(self.crs_lonlat)
         cornerlons = np.array([xmin, xmin, xmax, xmax])
         cornerlats = np.array([ymin, ymax, ymin, ymax])
         reader_x, reader_y = reader.lonlat2xy(cornerlons, cornerlats)
@@ -3857,10 +4134,10 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         return map_x, map_y, scalar, u_component, v_component
 
     def get_lonlat_bins(self, pixelsize_m):
-        latmin = self.latmin
-        latmax = self.latmax
-        lonmin = self.lonmin
-        lonmax = self.lonmax
+        latmin = self.result.lat.minval
+        latmax = self.result.lat.maxval
+        lonmin = self.result.lon.minval
+        lonmax = self.result.lon.maxval
         deltalat = pixelsize_m / 111000.0  # m to degrees
         deltalon = deltalat / np.cos(np.radians((latmin + latmax) / 2))
         latbin = np.arange(latmin - deltalat, latmax + deltalat, deltalat)
@@ -3870,28 +4147,28 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
     def get_histogram(self, pixelsize_m, **kwargs):
         from xhistogram.xarray import histogram
         lonbin, latbin = self.get_lonlat_bins(pixelsize_m)
-        max_om = int(self.ds.origin_marker.max().compute().values)
+        max_om = int(self.result.origin_marker.max().compute().values)
         origin_marker = range(max_om + 1)
         if 'weights' in kwargs and kwargs['weights'] is not None and kwargs[
                 'weights'].ndim < 2:
             kwargs['weights'] = xr.DataArray(
                 kwargs['weights'],
                 dims=['trajectory'],
-                coords={'trajectory': self.ds.coords['trajectory']})
+                coords={'trajectory': self.result.coords['trajectory']})
         # Xarray Dataset to store histogram per origin_marker
         h_om = xr.DataArray(np.zeros(
-            (len(self.ds.coords['time']), len(lonbin) - 1, len(latbin) - 1,
+            (len(self.result.coords['time']), len(lonbin) - 1, len(latbin) - 1,
              max_om + 1)),
                             name='density_origin_marker',
                             dims=('time', 'lon_bin', 'lat_bin',
                                   'origin_marker'))
-        h_om.coords['time'] = self.ds.coords['time']
+        h_om.coords['time'] = self.result.coords['time']
         h_om.coords['origin_marker'] = origin_marker
 
         for om in origin_marker:
             logger.info('\tcalculating for origin_marker %s...' % om)
-            h = histogram(self.ds.lon.where(self.ds.origin_marker == om),
-                          self.ds.lat.where(self.ds.origin_marker == om),
+            h = histogram(self.result.lon.where(self.result.origin_marker == om),
+                          self.result.lat.where(self.result.origin_marker == om),
                           bins=[lonbin, latbin],
                           dim=['trajectory'],
                           **kwargs)
@@ -3902,9 +4179,9 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         return h_om
 
     def get_density_array(self, pixelsize_m, weight=None):
-        lon = self.get_property('lon')[0]
-        lat = self.get_property('lat')[0]
-        times = self.get_time_array()[0]
+        lon = self.result.lon.values.T.copy()  # Copy to avoid mutating original lon/lat
+        lat = self.result.lat.values.T.copy()
+
         deltalat = pixelsize_m / 111000.0  # m to degrees
         deltalon = deltalat / np.cos(
             np.radians((np.nanmin(lat) + np.nanmax(lat)) / 2))
@@ -3915,11 +4192,11 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             np.nanmin(lon) - deltalat,
             np.nanmax(lon) + deltalon, deltalon)
         bins = (lon_array, lat_array)
-        z = self.get_property('z')[0]
+        z = self.result.z.values.T
         if weight is not None:
-            weight_array = self.get_property(weight)[0]
+            weight_array = self.result[weight].values.T
 
-        status = self.get_property('status')[0]
+        status = self.result.status.values.T
         lon_submerged = lon.copy()
         lat_submerged = lat.copy()
         lon_stranded = lon.copy()
@@ -3928,7 +4205,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         lat_submerged[z >= 0] = 1000
         lon[z < 0] = 1000
         lat[z < 0] = 1000
-        H = np.zeros((len(times), len(lon_array) - 1,
+        H = np.zeros((len(self.result.time), len(lon_array) - 1,
                       len(lat_array) - 1))  #.astype(int)
         H_submerged = H.copy()
         H_stranded = H.copy()
@@ -3940,7 +4217,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         except ValueError:
             contains_stranded = False
 
-        for i in range(len(times)):
+        for i in range(len(self.result.time)):
             if weight is not None:
                 weights = weight_array[i, :]
             else:
@@ -3970,9 +4247,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         # TODO: should be merged with get_density_array
         # KFD Jan 2021
         #
-        lon = self.get_property('lon')[0]
-        lat = self.get_property('lat')[0]
-        times = self.get_time_array()[0]
+        lon = self.result.lon.values.T.copy()
+        lat = self.result.lat.values.T.copy()
         #deltalat = pixelsize_m/111000.0  # m to degrees
         #deltalon = deltalat/np.cos(np.radians((np.nanmin(lat) +
         #                                       np.nanmax(lat))/2))
@@ -3999,11 +4275,11 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         bins = (x_array, y_array)
         outsidex, outsidey = max(x_array) * 1.5, max(y_array) * 1.5
 
-        z = self.get_property('z')[0]
+        z = self.result.z.values.T
         if weight is not None:
-            weight_array = self.get_property(weight)[0]
+            weight_array = self.result[weight].values.T
 
-        status = self.get_property('status')[0]
+        status = self.result.status.values.T
         #lon_submerged = lon.copy()
         #lat_submerged = lat.copy()
         #lon_stranded = lon.copy()
@@ -4023,7 +4299,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         x[z < 0] = outsidex
         y[z < 0] = outsidey
         H = np.zeros(
-            (len(times), len(x_array) - 1, len(y_array) - 1))  #.astype(int)
+            (len(self.result.time), len(x_array) - 1, len(y_array) - 1))  #.astype(int)
         H_submerged = H.copy()
         H_stranded = H.copy()
         try:
@@ -4036,7 +4312,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         except ValueError:
             contains_stranded = False
 
-        for i in range(len(times)):
+        for i in range(len(self.result.time)):
             if weight is not None:
                 weights = weight_array[i, :]
             else:
@@ -4068,7 +4344,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         '''Write netCDF file with map of particles densities'''
 
         if pixelsize_m == 'auto':
-            lon, lat = self.get_lonlats()
+            lon = self.result.lon
+            lat = self.result.lat
             latspan = lat.max() - lat.min()
             pixelsize_m = 30
             if latspan > .05:
@@ -4094,7 +4371,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         nc.createDimension('lon', len(lon_array))
         nc.createDimension('lat', len(lat_array))
         nc.createDimension('time', H.shape[0])
-        times = self.get_time_array()[0]
+        times = self.result.time
         if times[1] < times[0]:  # Revert for backward runs so that time is increasing
             times = times[::-1]
             H = np.flip(H, axis=0)
@@ -4102,7 +4379,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             H_stranded = np.flip(H_stranded, axis=0)
         timestr = 'seconds since 1970-01-01 00:00:00'
         nc.createVariable('time', 'f8', ('time', ))
-        nc.variables['time'][:] = date2num(times, timestr)
+        nc.variables['time'][:] = date2num(pd.to_datetime(times).to_pydatetime(), timestr)
         nc.variables['time'].units = timestr
         nc.variables['time'].standard_name = 'time'
         # Projection
@@ -4167,7 +4444,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         #
 
         if pixelsize_m == 'auto':
-            lon, lat = self.get_lonlats()
+            lon = self.result.lon
+            lat = self.result.lat
             latspan = lat.max() - lat.min()
             pixelsize_m = 30
             if latspan > .05:
@@ -4193,7 +4471,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                                        llcrnrlon=llcrnrlon, llcrnrlat=llcrnrlat,
                                        urcrnrlon=urcrnrlon, urcrnrlat=urcrnrlat)
         # calculate center coordinates
-        print(lon_array.shape, lat_array.shape)
+        logger.info(lon_array.shape, lat_array.shape)
         lon_array = (lon_array[:-1, :-1] + lon_array[1:, 1:]) / 2.
         lat_array = (lat_array[:-1, :-1] + lat_array[1:, 1:]) / 2.
 
@@ -4202,7 +4480,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         nc.createDimension('x', lon_array.shape[0])
         nc.createDimension('y', lon_array.shape[1])
         nc.createDimension('time', H.shape[0])
-        times = self.get_time_array()[0]
+        times = pd.to_datetime(self.result.time).to_pydatetime()
         timestr = 'seconds since 1970-01-01 00:00:00'
         nc.createVariable('time', 'f8', ('time', ))
         nc.variables['time'][:] = date2num(times, timestr)
@@ -4275,10 +4553,9 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         colortable.SetColorEntry(3, (0, 255, 0, 255))
         colortable.SetColorEntry(4, (0, 0, 255, 255))
 
-        lon = self.get_property('lon')[0]
-        lat = self.get_property('lat')[0]
-        status = self.get_property('status')[0]
-        times = self.get_time_array()[0]
+        lon = self.result.lon.values.T
+        lat = self.result.lat.values.T
+        status = self.result.status.values.T
         deltalat = pixelsize_km / 111.0  # km to degrees
         deltalon = deltalat / np.cos(np.radians((lat.min() + lat.max()) / 2))
         lat_array = np.arange(lat.min() - deltalat,
@@ -4288,16 +4565,16 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         ilon = (np.round((lon - lon.min()) / deltalon)).astype(int)
         ilat = (np.round((lat - lat.min()) / deltalat)).astype(int)
         # Setting masked values to zero, for use as indices
-        ilon[ilon.mask] = 0
-        ilat[ilat.mask] = 0
-        status[ilon.mask] = 0
+        ilon[np.isinf(ilon)] = 0
+        ilat[np.isinf(ilat)] = 0
+        status[np.isinf(ilon)] = 0
         image = np.zeros(
-            (len(times), len(lon_array), len(lat_array))).astype(int)
+            (len(self.result.time), len(lon_array), len(lat_array))).astype(int)
         geotransform = [
             lon_array.min(), deltalon, 0,
             lat_array.max(), 0, -deltalat
         ]
-        for i, t in enumerate(times):
+        for i, t in enumerate(pd.to_datetime(self.result.time)):
             image[i, ilon[i, :], ilat[i, :]] = status[i, :] + 1
             filename_i = t.strftime(filename)
             ds = driver.Create(
@@ -4315,19 +4592,23 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             outband.SetColorTable(colortable)
             ds = None
 
+    # TODO obsolete method - to be removed
     def get_time_array(self):
         """Return a list of output times of last run."""
 
-        # Making sure start_time is datetime, and not cftime object
-        self.start_time = datetime(self.start_time.year, self.start_time.month,
-                                   self.start_time.day, self.start_time.hour,
-                                   self.start_time.minute,
-                                   self.start_time.second)
-        td = self.time_step_output
-        time_array = [
-            self.start_time + td * i for i in range(self.steps_output)
-        ]
-        time_array_relative = [td * i for i in range(self.steps_output)]
+        logger.warning('Method get_time_array is obsolete and will soon be removed. Use o.result.time instead.')
+        ## Making sure start_time is datetime, and not cftime object
+        #self.start_time = datetime(self.start_time.year, self.start_time.month,
+        #                           self.start_time.day, self.start_time.hour,
+        #                           self.start_time.minute,
+        #                           self.start_time.second)
+        #td = self.time_step_output
+        #time_array = [
+        #    self.start_time + td * i for i in range(self.steps_output)
+        #]
+        #time_array_relative = [td * i for i in range(self.steps_output)]
+        time_array = pd.to_datetime(self.result.time).to_pydatetime()  # Should switch to Pandas times
+        time_array_relative = time_array - time_array[0]
         return time_array, time_array_relative
 
     def simulation_direction(self):
@@ -4340,29 +4621,29 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
     @require_mode(mode=Mode.Result)
     def plot_environment(self, filename=None, ax=None, show=True):
         """Plot mean wind and current velocities of element of last run."""
-        x_wind = self.get_property('x_wind')[0]
-        y_wind = self.get_property('y_wind')[0]
+        x_wind = self.result.x_wind
+        y_wind = self.result.y_wind
         wind = np.sqrt(x_wind**2 + y_wind**2)
-        x_sea_water_velocity = self.get_property('x_sea_water_velocity')[0]
-        y_sea_water_velocity = self.get_property('y_sea_water_velocity')[0]
+        x_sea_water_velocity = self.result.x_sea_water_velocity
+        y_sea_water_velocity = self.result.y_sea_water_velocity
         current = np.sqrt(x_sea_water_velocity**2 + y_sea_water_velocity**2)
-        wind = np.ma.mean(wind, axis=1)
-        current = np.ma.mean(current, axis=1)
-        time, time_relative = self.get_time_array()
-        time = np.array([t.total_seconds() / 3600. for t in time_relative])
+        wind = wind.mean(dim='trajectory', skipna=True)
+        current = current.mean(dim='trajectory', skipna=True)
+        time = self.result.time
+        time_relative = (time - time[0]) / np.timedelta64(1, 'h')
 
         if ax is None:
             fig = plt.figure()
             ax = fig.add_subplot(111)
-        ax.plot(time, wind, 'b', label='Wind speed')
+        ax.plot(time_relative, wind, 'b', label='Wind speed')
         ax.set_ylabel('Wind speed  [m/s]', color='b')
-        ax.set_xlim([0, time[-1]])
+        ax.set_xlim([0, time_relative[-1]])
         ax.set_ylim([0, wind.max() * 1.1])
 
         ax2 = ax.twinx()
-        ax2.plot(time, current, 'r', label='Current speed')
+        ax2.plot(time_relative, current, 'r', label='Current speed')
         ax2.set_ylabel('Current speed  [m/s]', color='r')
-        ax2.set_xlim([0, time[-1]])
+        ax2.set_xlim([0, time_relative[-1]])
         ax2.set_ylim([0, current.max() * 1.1])
         for tl in ax.get_yticklabels():
             tl.set_color('b')
@@ -4379,8 +4660,8 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
             plt.savefig(filename)
 
     @require_mode(mode=Mode.Result)
-    def plot_property(self, prop, filename=None, mean=False):
-        """Basic function to plot time series of any element properties."""
+    def plot_property(self, variable, filename=None, mean=False):
+        """Basic function to plot time series of any output variables."""
         import matplotlib.pyplot as plt
         from matplotlib import dates
 
@@ -4389,26 +4670,18 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         ax = fig.gca()
         ax.xaxis.set_major_formatter(hfmt)
         plt.xticks(rotation='vertical')
-        start_time = self.start_time
-        # In case start_time is unsupported cftime
-        start_time = datetime(start_time.year, start_time.month,
-                              start_time.day, start_time.hour,
-                              start_time.minute, start_time.second)
-        times = [
-            start_time + n * self.time_step_output
-            for n in range(self.steps_output)
-        ]
-        data = self.history[prop].T[0:len(times), :]
+
+        data = self.result[variable].T
         if mean is True:  # Taking average over elements
-            data = np.mean(data, axis=1)
-        plt.plot(times, data)
-        plt.title(prop)
+            data = data.mean(dim='trajectory', keep_attrs=True)
+
+        plt.plot(self.result.time, data)
+        plt.title(variable)
         plt.xlabel('Time  [UTC]')
-        try:
-            plt.ylabel('%s  [%s]' %
-                       (prop, self.elements.variables[prop]['units']))
-        except:
-            plt.ylabel(prop)
+        if hasattr(data, 'units'):
+            plt.ylabel('%s  [%s]' % (variable, data.units))
+        else:
+            plt.ylabel(variable)
         plt.subplots_adjust(bottom=.3)
         plt.grid()
         if filename is None:
@@ -4418,24 +4691,20 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
     @require_mode(mode=Mode.Result)
     def get_property(self, propname):
-        """Get property from history, sorted by status."""
-        index_of_first, index_of_last = \
-            self.index_of_activation_and_deactivation()
-        prop = self.history[propname].copy()
-        status = self.history['status'].copy()
+        """Get property from result, sorted by status."""
+        logger.warning('Method get_property is obsolete and will soon be removed. Use o.result.<property> instead.')
+        index_of_first, index_of_last = self.index_of_first_and_last()
+        prop = self.result[propname].copy()
+        status = self.result.status.copy()
         j = np.arange(status.shape[1])
-        # Fill arrays with last value before deactivation
-        for i in range(status.shape[0]):
-            status[i, j > index_of_last[i]] = status[i, index_of_last[i]]
-            prop[i, j > index_of_last[i]] = prop[i, index_of_last[i]]
 
         return prop.T, status.T
 
     @require_mode(mode=Mode.Result)
     def get_trajectory_lengths(self):
         """Calculate lengths and speeds along trajectories."""
-        lons = self.get_property('lon')[0]
-        lats = self.get_property('lat')[0]
+        lons = self.result.lon.T
+        lats = self.result.lat.T
         geod = pyproj.Geod(ellps='WGS84')
         a1, a2, distances = geod.inv(lons[0:-1, :], lats[0:-1, :],
                                      lons[1::, :], lats[1::, :])
@@ -4468,9 +4737,16 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
         velocity = velocity * self.elements.moving  # Do not move frosen elements
 
         # Calculate new positions
-        self.elements.lon, self.elements.lat, back_az = geod.fwd(
-            self.elements.lon, self.elements.lat, azimuth,
-            velocity * self.time_step.total_seconds())
+        if len(self.elements.lon) > 1:
+            self.elements.lon, self.elements.lat, back_az = geod.fwd(
+                self.elements.lon, self.elements.lat, azimuth,
+                velocity * self.time_step.total_seconds())
+        else:  # Avoiding pyproj warning for arrays with length 1
+            self.elements.lon, self.elements.lat, back_az = geod.fwd(
+                self.elements.lon[0], self.elements.lat[0], azimuth[0],
+                velocity[0] * self.time_step.total_seconds())
+            self.elements.lon = np.atleast_1d(self.elements.lon)
+            self.elements.lat = np.atleast_1d(self.elements.lat)
 
         # Check that new positions are valid
         if (self.elements.lon.min()
@@ -4495,7 +4771,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
     def __repr__(self):
         """String representation providing overview of model status."""
         outStr = '===========================\n'
-        if self.history is not None:
+        if self.result is not None:
             outStr += self.performance()
             outStr += '===========================\n'
         outStr += 'Model:\t' + type(self).__name__ + \
@@ -4539,7 +4815,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 outStr += '\tCalculation steps: %i * %s - total time: %s\n' % (
                     self.steps_calculation, self.time_step,
                     self.time - self.start_time)
-                outStr += '\tOutput steps: %i * %s\n' % (self.steps_output,
+                outStr += '\tOutput steps: %i * %s\n' % (len(self.result.time),
                                                          self.time_step_output)
         if hasattr(self, 'messages'):
             outStr += '-------------------\n'
@@ -4564,7 +4840,7 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
     def add_halo_readers(self):
         """Adding some Thredds and file readers in prioritised order"""
 
-        self.add_readers_from_file(self.test_data_folder() +
+        self.add_readers_from_file(opendrift.test_data_folder +
                                    '../../opendrift/scripts/data_sources.txt')
 
     def _sphinx_gallery_filename(self, stack_offset=3):
@@ -4709,9 +4985,11 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                 o = self.clone()
                 o.seed_elements(lons.ravel(), lats.ravel(), time=t, z=z)
                 o.run(duration=duration, time_step=time_step)
-                f_x1, f_y1 = proj(o.history['lon'].T[-1].reshape(X.shape),
-                                  o.history['lat'].T[-1].reshape(X.shape))
-                lcs['RLCS'][i, :, :] = ftle(f_x1 - X, f_y1 - Y, delta, T)
+                lon = o.result.lon.ffill(dim='time')
+                lat = o.result.lat.ffill(dim='time')
+                b_x1, b_y1 = proj(lon.T[-1].values.reshape(X.shape),
+                                  lat.T[-1].values.reshape(X.shape))
+                lcs['RLCS'][i, :, :] = ftle(b_x1 - X, b_y1 - Y, delta, T)
             # Backwards
             if ALCS is True:
                 o = self.clone()
@@ -4720,8 +4998,10 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
                                 time=t + duration,
                                 z=z)
                 o.run(duration=duration, time_step=-time_step)
-                b_x1, b_y1 = proj(o.history['lon'].T[-1][::-1].reshape(X.shape),
-                                  o.history['lat'].T[-1][::-1].reshape(X.shape))
+                lon = o.result.lon.ffill(dim='time')
+                lat = o.result.lat.ffill(dim='time')
+                b_x1, b_y1 = proj(lon.T[-1][::-1].values.reshape(X.shape),
+                                  lat.T[-1][::-1].values.reshape(X.shape))
                 lcs['ALCS'][i, :, :] = ftle(b_x1 - X, b_y1 - Y, delta, T)
 
         lcs['RLCS'] = np.ma.masked_invalid(lcs['RLCS'])
@@ -4734,15 +5014,16 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
 
     def center_of_gravity(self, onlysurface=False):
         """
-        calculate center of mass and variance of all elements
+        Calculate center of mass and variance of all elements
+
         returns  (lon,lat), variance
         where (lon,lat) are the coordinates of the center of mass as
-        function of time"""
-        #lon,lat = self.get_property('lon')[0], self.get_property('lat')[0]
-        lon, lat = self.history['lon'], self.history['lat']
+        function of time
+        """
+        lon, lat = self.result.lon, self.result.lat
         x, y = self.proj_latlon(lon, lat)
         if onlysurface == True:
-            z = self.history['z']
+            z = self.result.z
             submerged = z < 0
             x = np.ma.array(x, mask=submerged)
             y = np.ma.array(y, mask=submerged)
@@ -4758,3 +5039,57 @@ class OpenDriftSimulation(PhysicsMethods, Timeable, Configurable):
     def gui_postproc(self):
         '''To be overloaded by subclasses'''
         pass
+
+    def _evaluate_key(self, key):
+        # Presently assuming that key is a config key
+        return self.get_config(key, 'not_implemented')
+
+    def _set_mode(self, mode):
+
+        mode = getattr(Mode, mode.capitalize(), None)
+
+        if mode is None:
+            raise ValueError(f'Available modes are {list(Mode.__members__.keys())}')
+
+        self.mode = mode
+
+def evaluate_conditional(key, operator, value, self=None):
+    """Evaluate a condition as True or False
+
+    This can be used to:
+    - skip required_variables that are not required, based on config setting
+    - store previous value of element property or environment variable, based on config setting
+    - disable a config setting based on another setting (for dynamic menus)
+
+    key: e.g. config key/setting as string
+    operator: relation between key and value, one from operator_map below
+    value: the provided value to be matched with operator against actual key
+
+    Returns: True or False
+    """
+
+    operator_map = {
+        '==': lambda x, y: x == y,
+        '!=': lambda x, y: x != y,
+        '<': lambda x, y: x < y,
+        '<=': lambda x, y: x <= y,
+        '>': lambda x, y: x > y,
+        '>=': lambda x, y: x >= y,
+        'in': lambda x, y: x in y,
+        'is': lambda x, y: x is y,
+        'is not': lambda x, y: x is not y,
+        'or': lambda x, y: x or y,
+        'and': lambda x, y: x and y,
+    }
+
+    if isinstance(key, tuple):
+        key = evaluate_conditional(key[0], key[1], key[2], self)
+
+    if self is not None and not isinstance(key, bool):
+        # If a OpenDrift instance is provided, this will evaluate the key, e.g. with get_config
+        key = self._evaluate_key(key)
+
+    if isinstance(value, tuple):
+        value = evaluate_conditional(value[0], value[1], value[2], self)
+
+    return operator_map[operator](key, value)

@@ -5,19 +5,20 @@ Generic example
 """
 
 from datetime import datetime, timedelta
+from opendrift import test_data_folder as tdf
 from opendrift.readers import reader_netCDF_CF_generic
 from opendrift.models.openoil import OpenOil
 
 o = OpenOil(loglevel=20)  # Set loglevel to 0 for debug information
 
 # Arome atmospheric model
-reader_arome = reader_netCDF_CF_generic.Reader(o.test_data_folder() + '16Nov2015_NorKyst_z_surface/arome_subset_16Nov2015.nc')
+reader_arome = reader_netCDF_CF_generic.Reader(tdf + '16Nov2015_NorKyst_z_surface/arome_subset_16Nov2015.nc')
 # Norkyst ocean model
-reader_norkyst = reader_netCDF_CF_generic.Reader(o.test_data_folder() + '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc')
+reader_norkyst = reader_netCDF_CF_generic.Reader(tdf + '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc')
 
 # Uncomment to use live data from thredds
 #reader_arome = reader_netCDF_CF_generic.Reader('https://thredds.met.no/thredds/dodsC/mepslatest/meps_lagged_6_h_latest_2_5km_latest.nc')
-#reader_norkyst = reader_netCDF_CF_generic.Reader('https://thredds.met.no/thredds/dodsC/sea/norkyst800m/1h/aggregate_be')
+#reader_norkyst = reader_netCDF_CF_generic.Reader('https://thredds.met.no/thredds/dodsC/fou-hi/norkystv3_800m_m00_be')
 
 o.add_reader([reader_norkyst, reader_arome])
 
@@ -44,8 +45,7 @@ o.seed_elements(lon=4.6, lat=60.0, radius=50, number=3000, time=time,
 #%%
 # Running model
 o.run(end_time=reader_norkyst.end_time, time_step=1800,
-      time_step_output=3600, outfile='openoil.nc',
-      export_variables=['mass_oil'])
+      time_step_output=3600, outfile='openoil.nc')
 
 #%%
 # Print and plot results
@@ -56,8 +56,8 @@ o.plot(fast=True)
 
 #%%
 # Or an animation can be generated with:
-
 o.animation(fast=True)
+
 
 #%%
 # .. image:: /gallery/animations/example_generic_0.gif

@@ -13,16 +13,13 @@ o = OpenOil(loglevel=20)  # Set loglevel to 0 for debug information
 #%%
 # Using live data from Thredds
 o.add_readers_from_list([
-    'https://thredds.met.no/thredds/dodsC/sea/norkyst800m/1h/aggregate_be'])
+    'https://thredds.met.no/thredds/dodsC/fou-hi/norkystv3_800m_m00_be'])
 
 #%%
 # Adjusting some configuration
 o.set_config('processes:dispersion', True)
 o.set_config('processes:evaporation', False)
 o.set_config('processes:emulsification', True)
-o.disable_vertical_motion()
-#o.set_config('drift:vertical_mixing', False)
-#o.set_config('drift:vertical_mixing', False)
 
 #%%
 # Seed elements along cone, e.g. ship track with

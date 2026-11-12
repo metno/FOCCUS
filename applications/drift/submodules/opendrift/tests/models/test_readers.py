@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
+from opendrift import test_data_folder as tdf
 from opendrift.models.oceandrift import OceanDrift
 from opendrift.models.leeway import Leeway
 from opendrift.models.openoil import OpenOil
@@ -30,7 +31,7 @@ from opendrift.readers import reader_ROMS_native
 from opendrift.readers import reader_global_landmask
 from opendrift.readers import reader_constant
 from opendrift.readers import reader_lazy
-from opendrift.readers import reader_from_url
+from opendrift.readers import reader_from_urlpath
 from opendrift.models.pelagicegg import PelagicEggDrift
 from opendrift.readers import reader_current_from_track
 from opendrift.errors import OutsideSpatialCoverageError, WrongMode
@@ -40,10 +41,10 @@ o = OceanDrift(loglevel=20)
 
 reader_list = [
     'www.nonexistingurl.com',
-    o.test_data_folder() +
+    tdf +
         '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc',
     '/nonexistingdisk/nonexistingfile.ext',
-    o.test_data_folder() +
+    tdf +
             '2Feb2016_Nordic_sigma_3d/AROME_MetCoOp_00_DEF_20160202_subset.nc']
 
 
@@ -53,7 +54,7 @@ class TestReaders(unittest.TestCase):
     def test_adding_readers(self):
         o = OceanDrift()
         landmask = reader_global_landmask.Reader()
-        r = reader_ROMS_native.Reader(o.test_data_folder() +
+        r = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         o.add_reader([r, landmask])
         self.assertEqual(o.env.priority_list['land_binary_mask'],
@@ -74,49 +75,11 @@ class TestReaders(unittest.TestCase):
         self.assertEqual(o.env.priority_list['x_sea_water_velocity'],
                          ['roms native'])
         self.assertEqual(o.env.priority_list['x_wind'],
-                         [o.test_data_folder() +
+                         [tdf +
             '2Feb2016_Nordic_sigma_3d/AROME_MetCoOp_00_DEF_20160202_subset.nc'])
 
-    # Disabling this test after simulations now have Mode,
-    # repeated run with same object not anymore allowed
-    #def test_repeated_run(self):
-    #    # NOTE: this test fails if outfile is not None
-    #    #outfile = 'leeway_test.nc'
-    #    outfile = None
-    #    o = OceanDrift(loglevel=50)
-    #    o.set_config('drift:vertical_mixing', False)
-    #    o.add_readers_from_list(reader_list)
-    #    o.seed_elements(lon=14, lat=67.85,
-    #                    time=datetime(2016, 2, 2, 12))
-    #    o.run(steps=5, outfile=outfile)
-    #    lon1 = o.get_property('lon')[0]
-    #    # Repeated run with same object
-    #    o.seed_elements(lon=14, lat=67.85,
-    #                    time=datetime(2016, 2, 2, 12))
-    #    o.run(steps=5, outfile=outfile)
-    #    lon2 = o.get_property('lon')[0]
-    #    # Third run, with different config
-    #    o.seed_elements(lon=14, lat=67.85,
-    #                    time=datetime(2016, 2, 2, 12),
-    #                    wind_drift_factor=.1)
-    #    o.run(steps=5)
-    #    lon3 = o.get_property('lon')[0]
-    #    # Fourth run, with different time
-    #    o.reset()  # Reset is needed due to new start_time
-    #    o.seed_elements(lon=14, lat=67.85,
-    #                    time=datetime(2016, 2, 2, 13),
-    #                    wind_drift_factor=.1)
-    #    o.run(steps=5, outfile=outfile)
-    #    lon4 = o.get_property('lon')[0]
-
-    #    # Check results
-    #    self.assertEqual(lon1[-1][0], lon2[-1][0])
-    #    self.assertNotEqual(lon3[-1][0], lon2[-1][0])
-
-    #    #os.remove(outfile)
-
-    def test_reader_from_url(self):
-        readers = reader_from_url(reader_list)
+    def test_reader_from_urlpath(self):
+        readers = reader_from_urlpath(reader_list)
         self.assertIsNone(readers[0])
         self.assertTrue(isinstance(readers[1],
                                    reader_ROMS_native.Reader))
@@ -126,7 +89,7 @@ class TestReaders(unittest.TestCase):
 
     def test_lazy_reader(self):
         o = OceanDrift(loglevel=20)
-        lr = reader_lazy.Reader(o.test_data_folder() +
+        lr = reader_lazy.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         self.assertFalse(lr.initialised)
         self.assertEqual(len(lr.covers_positions([15], [69])[0]), 1)
@@ -134,7 +97,7 @@ class TestReaders(unittest.TestCase):
         self.assertTrue(lr.initialised)
 
         # Make a corresponding, unlazy reader
-        rr = reader_ROMS_native.Reader(o.test_data_folder() +
+        rr = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         self.assertEqual(len(rr.covers_positions([15], [69])[0]), 1)
         self.assertEqual(len(rr.covers_positions([0], [0])[0]), 0)
@@ -177,7 +140,7 @@ class TestReaders(unittest.TestCase):
 
     def test_ROMS_native_stranding(self):
         o = OceanDrift(loglevel=0)
-        r = reader_ROMS_native.Reader(o.test_data_folder() +
+        r = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         o.add_reader(r)
         o.set_config('general:use_auto_landmask', False)
@@ -188,19 +151,19 @@ class TestReaders(unittest.TestCase):
                         wind_drift_factor=.02,
                         number=10, radius=1000)
         o.run(steps=8)
-        self.assertEqual(o.num_elements_deactivated(), 1)
+        self.assertEqual(o.num_elements_deactivated(), 3)
 
     #def test_lazy_readers_and_corrupt_data(self):
     #    o = OceanDrift(loglevel=0)
 
-    #    o.add_readers_from_list([o.test_data_folder() +
+    #    o.add_readers_from_list([tdf +
     #        '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc'])
 
     #    reader_constant_current_corrupt = \
     #        reader_constant.Reader({'x_sea_water_velocity': np.nan,
     #                                'y_sea_water_velocity': np.nan})
     #    o.add_reader(reader_constant_current_corrupt)
-    #    o.add_readers_from_list([o.test_data_folder() +
+    #    o.add_readers_from_list([tdf +
     #        '2Feb2016_Nordic_sigma_3d/Arctic20_1to5Feb_2016.nc'])
 
     #    print o
@@ -232,7 +195,7 @@ class TestReaders(unittest.TestCase):
 
     #def test_lazy_reader_oildrift_real(self):
     #    o = OpenOil(loglevel=0)
-    #    o.add_readers_from_file(o.test_data_folder() +
+    #    o.add_readers_from_file(tdf +
     #        '../../opendrift/scripts/data_sources.txt')
 
     #    o.seed_elements(lon=4, lat=60.0,
@@ -244,8 +207,8 @@ class TestReaders(unittest.TestCase):
 
         o1 = Leeway(loglevel=0)
         #o1.set_config('environment:fallback:land_binary_mask', 0)
-        o1.required_variables = [r for r in o1.required_variables
-                                 if r != 'land_binary_mask']
+        o1.required_variables = {n:r for n,r in o1.required_variables.items()
+                                 if n != 'land_binary_mask'}
         o1.add_readers_from_list(reader_list, lazy=False)
         time = o1.env.readers['roms native'].start_time
         o1.seed_elements(lat=67.85, lon=14, time=time)
@@ -253,22 +216,22 @@ class TestReaders(unittest.TestCase):
 
         o2 = Leeway(loglevel=20)
         #o2.set_config('environment:fallback:land_binary_mask', 0)
-        o2.required_variables = [r for r in o1.required_variables
-                                 if r != 'land_binary_mask']
+        o2.required_variables = {n:r for n,r in o1.required_variables.items()
+                                 if n != 'land_binary_mask'}
         o2.add_readers_from_list(reader_list, lazy=True)
         o2.seed_elements(lat=67.85, lon=14, time=time)
         o2.run(steps=5)
 
         # Some differences in wind and current components
         # due to different coordinate system
-        for var in o1.history.dtype.names:
+        for var in o1.result.data_vars:
             if var in ['x_wind', 'y_wind', 'x_sea_water_velocity',
                        'y_sea_water_velocity']:
                 tolerance = 1
             else:
                 tolerance = 5
             self.assertIsNone(np.testing.assert_array_almost_equal(
-                o1.history[var], o2.history[var], tolerance))
+                o1.result[var], o2.result[var], tolerance))
 
     def test_constant_and_lazy_reader_leeway(self):
         cw = reader_constant.Reader({'x_wind':5, 'y_wind': 6})
@@ -282,7 +245,7 @@ class TestReaders(unittest.TestCase):
         o.set_config('environment:fallback:y_sea_water_velocity', 0.1)
         time = datetime(2016,2,2,12)
         o.seed_elements(lat=67.85, lon=14, time=time)
-        o.run(steps=2)
+        o.run(steps=2, time_step=600, time_step_output=600)
         self.assertAlmostEqual(o.elements.lat[0], 67.8548, 3)
 
     def test_automatic_landmask(self):
@@ -293,7 +256,7 @@ class TestReaders(unittest.TestCase):
         o.run(steps=2)
 
     def test_reader_coverage(self):
-        r = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        r = reader_netCDF_CF_generic.Reader(tdf +
             '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc')
         # Element outside reader domain
         self.assertEqual(len(r.covers_positions(5, 80)[0]), 0)
@@ -314,7 +277,7 @@ class TestReaders(unittest.TestCase):
 
     def test_outside_reader_time_coverage(self):
         o = PelagicEggDrift()
-        reader = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        reader = reader_netCDF_CF_generic.Reader(tdf +
             '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc')
         o.add_reader(reader)
         o.set_config('environment:fallback:x_sea_water_velocity', 1)
@@ -323,14 +286,14 @@ class TestReaders(unittest.TestCase):
         o.seed_elements(lon=4.8, lat=60, number=1, time=reader.end_time)
         o.run(steps=2)
         # Check that fallback value is used when outside time coverage
-        self.assertEqual(o.history['x_sea_water_velocity'][0][-1], 1.0)
+        self.assertEqual(o.result.x_sea_water_velocity[0, -1], 1.0)
 
     def test_reader_netcdf(self):
         """Check reader functionality."""
 
-        reader1 = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        reader1 = reader_netCDF_CF_generic.Reader(tdf +
             '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc')
-        reader2 = reader_ROMS_native.Reader(o.test_data_folder() +
+        reader2 = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         readers = [reader1, reader2]
 
@@ -370,7 +333,7 @@ class TestReaders(unittest.TestCase):
 
     def test_vertical_profiles(self):
 
-        norkyst3d = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        norkyst3d = reader_netCDF_CF_generic.Reader(tdf +
             '14Jan2016_NorKyst_z_3d/NorKyst-800m_ZDEPTHS_his_00_3Dsubset.nc')
         lon = np.array([4.73])
         lat = np.array([62.35])
@@ -410,7 +373,7 @@ class TestReaders(unittest.TestCase):
 
     def test_vertical_profile_from_simulation(self):
         o = OpenOil()
-        r = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        r = reader_netCDF_CF_generic.Reader(tdf +
             '14Jan2016_NorKyst_z_3d/NorKyst-800m_ZDEPTHS_his_00_3Dsubset.nc')
         variables = ['x_sea_water_velocity', 'x_sea_water_velocity',
                      'sea_water_temperature']
@@ -430,7 +393,7 @@ class TestReaders(unittest.TestCase):
         assert o.environment_profiles['z'].min() == -50
 
     def test_vertical_interpolation(self):
-        norkyst3d = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        norkyst3d = reader_netCDF_CF_generic.Reader(tdf +
             '14Jan2016_NorKyst_z_3d/NorKyst-800m_ZDEPTHS_his_00_3Dsubset.nc')
         lon = np.array([4.73, 4.75])
         lat = np.array([62.35, 62.30])
@@ -452,7 +415,7 @@ class TestReaders(unittest.TestCase):
                                8.32, 2)
 
     def test_vertical_interpolation_sigma(self):
-        nordic3d = reader_ROMS_native.Reader(o.test_data_folder() +
+        nordic3d = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         lon = np.array([12.46, 12.46, 12.46])
         lat = np.array([68.21, 69.31, 69.31])
@@ -473,8 +436,8 @@ class TestReaders(unittest.TestCase):
 
     def test_get_environment(self):
         o = PelagicEggDrift(loglevel=0)
-        reader_nordic = reader_ROMS_native.Reader(o.test_data_folder() + '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc', name='Nordic')
-        reader_arctic = reader_netCDF_CF_generic.Reader(o.test_data_folder() + '2Feb2016_Nordic_sigma_3d/Arctic20_1to5Feb_2016.nc', name='Arctic')
+        reader_nordic = reader_ROMS_native.Reader(tdf + '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc', name='Nordic')
+        reader_arctic = reader_netCDF_CF_generic.Reader(tdf + '2Feb2016_Nordic_sigma_3d/Arctic20_1to5Feb_2016.nc', name='Arctic')
         ######################################################
         # Vertical interpolation is another issue to be fixed:
         reader_nordic.zlevels = reader_arctic.z
@@ -548,7 +511,7 @@ class TestReaders(unittest.TestCase):
         cw = reader_constant.Reader({'x_wind':5, 'y_wind': 6})
         cc = reader_constant.Reader({'x_sea_water_velocity':0, 'y_sea_water_velocity': .2})
         cs = reader_constant.Reader({'sea_water_temperature': 278})
-        r = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        r = reader_netCDF_CF_generic.Reader(tdf +
             '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc')
         o.add_reader([cw, cc, r])
         # TODO: should check why adding constant reader with
@@ -559,10 +522,10 @@ class TestReaders(unittest.TestCase):
 
     def test_clip_domain(self):
         o = OceanDrift(loglevel=50)
-        r1 = reader_ROMS_native.Reader(o.test_data_folder() +
+        r1 = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         r1.clip_boundary_pixels(20)
-        r2 = reader_ROMS_native.Reader(o.test_data_folder() +
+        r2 = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         self.assertEqual(r2.shape, (151, 81))
         self.assertEqual(r1.shape, (111, 41))
@@ -581,14 +544,14 @@ class TestReaders(unittest.TestCase):
         o2.seed_elements(lon=15, lat=70.1, time=r1.start_time)
         o2.run(time_step=3600*3, duration=timedelta(hours=48))
         # Compare
-        lat1 = o1.get_property('lat')[0]
-        lat2 = o2.get_property('lat')[0]
-        self.assertEqual(len(lat1), 13)
-        self.assertEqual(len(lat2), 17)
+        lat1 = o1.result.lat
+        lat2 = o2.result.lat
+        self.assertEqual(lat1.sizes['time'], 12)
+        self.assertEqual(lat2.sizes['time'], 17)
         self.assertIsNone(np.testing.assert_allclose(
-                            lat1[0:12], lat2[0:12]))
+                            lat1, lat2.isel(time=slice(0,12))))
         # Test reader netCDF_CF_generic
-        r = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        r = reader_netCDF_CF_generic.Reader(tdf +
             '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc')
         self.assertEqual(r.shape, (301, 201))
         o3 = OceanDrift(loglevel=50)
@@ -606,12 +569,12 @@ class TestReaders(unittest.TestCase):
         o4.seed_elements(lon=4.36, lat=61.7, time=r.start_time)
         o4.run(steps=24)
         # Compare
-        lat3 = o3.get_property('lat')[0]
-        lat4 = o4.get_property('lat')[0]
-        self.assertEqual(len(lat3), 25)
-        self.assertEqual(len(lat4), 13)
+        lat3 = o3.result.lat
+        lat4 = o4.result.lat
+        self.assertEqual(lat3.sizes['time'], 25)
+        self.assertEqual(lat4.sizes['time'], 12)
         self.assertIsNone(np.testing.assert_allclose(
-                            lat3[0:12], lat4[0:12]))
+                            lat3.isel(time=slice(0,12)), lat4))
 
     def test_reader_current_from_track(self):
         """Check if extrapolated currents are of expected value"""
@@ -620,13 +583,12 @@ class TestReaders(unittest.TestCase):
         obstime = [datetime(2015, 11, 16, 0), datetime(2015, 11, 16, 6)]
 
         o = OceanDrift(loglevel=20)
-        reader_wind = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        reader_wind = reader_netCDF_CF_generic.Reader(tdf +
                     '16Nov2015_NorKyst_z_surface/arome_subset_16Nov2015.nc')
 
         reader_current = reader_current_from_track.Reader(obslon, obslat, obstime,
                     wind_east=0, wind_north=0, windreader=reader_wind, wind_factor=0.018)
         self.assertAlmostEqual(reader_current.x_sea_water_velocity.data[0],0.2236, 4)
-
 
     def test_valid_minmax(self):
         """Check that invalid values are replaced with fallback."""
@@ -635,7 +597,7 @@ class TestReaders(unittest.TestCase):
         minval = variables.standard_names['x_wind']['valid_min']
         # Setting valid_min to -5, to check that replacement works
         variables.standard_names['x_wind']['valid_min'] = -5
-        reader_wind = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        reader_wind = reader_netCDF_CF_generic.Reader(tdf +
                     '16Nov2015_NorKyst_z_surface/arome_subset_16Nov2015.nc')
         o.add_reader(reader_wind)
         o.set_config('environment:fallback:x_sea_water_velocity', 0)
@@ -645,8 +607,7 @@ class TestReaders(unittest.TestCase):
         o.seed_elements(lon=4, lat=60, time=reader_wind.start_time)
         o.run(steps=1)
         variables.standard_names['x_wind']['valid_min'] = minval  # reset
-        w = o.get_property('x_wind')[0][0]
-        self.assertAlmostEqual(w, 2.0, 1)
+        self.assertAlmostEqual(o.result.x_wind[0,0], 2.0, 1)
 
     def test_valid_minmax_nanvalues(self):
         from opendrift.readers.basereader import variables
@@ -655,14 +616,13 @@ class TestReaders(unittest.TestCase):
         variables.standard_names['x_sea_water_velocity']['valid_max'] = .1
         o = OceanDrift(loglevel=20)
         o.set_config('environment:fallback:land_binary_mask', 0)
-        norkyst = reader_netCDF_CF_generic.Reader(o.test_data_folder() + '14Jan2016_NorKyst_z_3d/NorKyst-800m_ZDEPTHS_his_00_3Dsubset.nc')
+        norkyst = reader_netCDF_CF_generic.Reader(tdf + '14Jan2016_NorKyst_z_3d/NorKyst-800m_ZDEPTHS_his_00_3Dsubset.nc')
         o.add_reader(norkyst)
 
         o.seed_elements(lon=4.95, lat=62, number=10, time=norkyst.start_time)
         o.run(steps=2)
         variables.standard_names['x_sea_water_velocity']['valid_max'] = maxval  # reset
-        u = o.get_property('x_sea_water_velocity')[0]
-        self.assertAlmostEqual(u.max(), -.0718, 3)  # Some numerical error allowed
+        self.assertAlmostEqual(o.result.x_sea_water_velocity.max().values, -.0979, 3)  # Some numerical error allowed
 
 
 if __name__ == '__main__':

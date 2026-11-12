@@ -29,6 +29,14 @@ from opendrift.models.openoil import OpenOil
 class TestSeed(unittest.TestCase):
     """Tests of seeding methods"""
 
+    def test_seed_elements_config(self):
+        """Check that default element properties are fetched from config if not provided explicitly"""
+        o = OceanDrift(loglevel=50)
+        wdf = 5
+        o.set_config('seed:wind_drift_factor', wdf)
+        o.seed_elements(lon=4, lat=60, time=datetime.now())
+        assert o.elements_scheduled.wind_drift_factor == wdf
+
     def test_seed_elements(self):
         # Some cases with expected outcome
         lon_vec = np.array([3, 4, 5])
@@ -210,10 +218,9 @@ class TestSeed(unittest.TestCase):
         o.set_config('seed:ocean_only', True)
         o.seed_elements(lon=[4.8, 5.15], lat=[60, 60], time=datetime.now())
         o.run(steps=1)
-        lat, s = o.get_property('lat')[0]
         # Check that the second point over land has been moved to ocean
-        self.assertAlmostEqual(lat[0], 60, 5)
-        self.assertNotAlmostEqual(lat[1], 60, 5)
+        assert o.result.lat.isel(time=0, trajectory=0) == pytest.approx(60)
+        assert o.result.lat.isel(time=1, trajectory=0) == pytest.approx(60)
 
     def test_seed_letters(self):
         o = OceanDrift(loglevel=50)

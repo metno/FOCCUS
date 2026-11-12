@@ -26,7 +26,13 @@ import sys
 import argparse
 from datetime import datetime
 import numpy as np
-from opendrift.readers import applicable_readers
+from opendrift.readers import reader_from_urlpath
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except:
+    pass
 
 
 def main():
@@ -39,6 +45,9 @@ def main():
     parser.add_argument('-vmin', dest='vmin',
                         default=None, nargs='?',
                         help='Minimum value for colorbar')
+    parser.add_argument('-lscale', dest='lscale',
+                        default='auto', nargs='?',
+                        help='Scale of landmask: f, h, i, l, c or auto (default)')
     parser.add_argument('-vmax', dest='vmax',
                         default=None, nargs='?',
                         help='Maximum value for colorbar')
@@ -53,26 +62,12 @@ def main():
 
     args = parser.parse_args()
 
-    readers = applicable_readers(args.filename)
-    if len(readers) == 0:
-        raise ValueError(f'No applicable readers for {args.filename}')
+    r = reader_from_urlpath(args.filename, print_errors=args.e)
 
-    for reader in readers:
-        try:
-            print('Testing %s...' % reader.__file__)
-            r = reader.Reader(args.filename)
-            print(r)
-            break
-        except Exception as me:
-            if args.e is True:
-                print(me)
-                import traceback
-                print(traceback.format_exc())
-                print('---------------------------------------')
-            print('...not applicable.')
+    if r is None:
+        raise ValueError('No readers applicable for ' + args.filename)
 
-    if not 'r' in locals():
-        sys.exit('No readers applicable for ' + args.filename)
+    print(r)
 
     if args.time is None:
         time = r.start_time
@@ -94,7 +89,7 @@ def main():
 
     if args.variable != 'noplot':
         if args.variable is None:
-            r.plot()
+            r.plot(lscale=args.lscale)
         else:
             if args.vmin is None:
                 vmin = None
@@ -105,7 +100,7 @@ def main():
             else:
                 vmax = float(args.vmax)
 
-            r.plot(args.variable, vmin=vmin, vmax=vmax, time=time)
+            r.plot(args.variable, vmin=vmin, vmax=vmax, time=time, lscale=args.lscale)
 
 if __name__ == '__main__':
     main()

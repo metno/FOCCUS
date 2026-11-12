@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import xarray as xr
 
+from opendrift import test_data_folder as tdf
 from opendrift.models.oceandrift import OceanDrift
 from opendrift.readers import reader_netCDF_CF_generic
 from opendrift.readers import reader_ROMS_native
@@ -38,6 +39,21 @@ o = OceanDrift()
 
 class TestInterpolation(unittest.TestCase):
     """Tests spatial interpolation"""
+
+    def test_nearest2d_interpolator_grid_node_exactness(self):
+        """Nearest2DInterpolator must return the exact grid value when
+        queried exactly at a grid node."""
+        xgrid = np.array([0., 1., 2., 3., 4.])
+        ygrid = np.array([0., 1.])
+        array2d = np.array([
+            [10., 11., 12., 13., 14.],
+            [10., 11., 12., 13., 14.],
+        ])
+        x = xgrid.copy()
+        y = np.zeros_like(xgrid)
+        interp = Nearest2DInterpolator(xgrid, ygrid, x, y)
+        result = interp(array2d)
+        np.testing.assert_array_equal(result, array2d[0, :])
 
     def test_dateline(self):
 
@@ -104,7 +120,6 @@ class TestInterpolation(unittest.TestCase):
         o.add_readers_from_list([fc, fw])
         o.seed_elements(lon=[-175, 175], lat=[60, 60], time=start_time, wind_drift_factor=.1)
         o.run(steps=2)
-        #o.plot(fast=True)
         # Check that current give convergence, and that
         # wind is northwards east of 180 and southwards to the west
         np.testing.assert_array_almost_equal(o.elements.lon, [-175.129,  175.129], decimal=3)
@@ -115,11 +130,32 @@ class TestInterpolation(unittest.TestCase):
         o.add_readers_from_list([fc, fw2])
         o.seed_elements(lon=[-175, 175], lat=[60, 60], time=start_time, wind_drift_factor=.1)
         o.run(steps=2)
-        #o.plot(fast=True)
         # Check that current give convergence, and that
         # wind is northwards east of 180 and southwards to the west
         np.testing.assert_array_almost_equal(o.elements.lon, [-175.129,  175.129], decimal=3)
         np.testing.assert_array_almost_equal(o.elements.lat, [60.006, 59.994], decimal=3)
+
+        # With elements spread globally (both around dateline and 0-meredian)
+        o = OceanDrift(loglevel=30)
+        o.add_readers_from_list([fc, fw])
+        lons = np.arange(-180, 181, 20)
+        lats = np.arange(-80, 81, 20)
+        lons, lats = np.meshgrid(lons, lats)
+        o.seed_elements(lon=lons, lat=lats, time=start_time, wind_drift_factor=.1)
+        o.run(steps=2, time_step=3600*12)
+        # Check expected drift direction for each quadrant
+        lon = o.result.lon
+        lat = o.result.lat
+        # North-westwards
+        np.testing.assert_array_almost_equal(lon[25,:], [-60, -60.77, -61.55], decimal=2)
+        np.testing.assert_array_almost_equal(lat[25,:], [-60, -59.96, -59.92], decimal=2)
+        np.testing.assert_array_almost_equal(lon[100,:], [-80, -80.41, -80.83], decimal=2)
+        np.testing.assert_array_almost_equal(lat[100,:], [20, 20.04, 20.08], decimal=2)
+        # South-eastwards
+        np.testing.assert_array_almost_equal(lon[35,:], [140, 140.77, 141.55], decimal=2)
+        np.testing.assert_array_almost_equal(lat[35,:], [-60, -60.04, -60.07], decimal=2)
+        np.testing.assert_array_almost_equal(lon[112,:], [160, 160.41, 160.83], decimal=2)
+        np.testing.assert_array_almost_equal(lat[112,:], [20, 19.96, 19.92], decimal=2)
 
         # Cleaning up
         os.remove(fw)
@@ -281,7 +317,7 @@ class TestInterpolation(unittest.TestCase):
 
     def test_interpolation_3dArrays(self):
         """Test interpolation."""
-        reader = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        reader = reader_netCDF_CF_generic.Reader(tdf +
             '14Jan2016_NorKyst_z_3d/NorKyst-800m_ZDEPTHS_his_00_3Dsubset.nc')
 
         # 100000 points within 50x50 pixels over sea (corner of domain)
@@ -303,7 +339,7 @@ class TestInterpolation(unittest.TestCase):
         self.assertAlmostEqual(env['x_sea_water_velocity'][100],
                                0.075019, 3)
         self.assertAlmostEqual(prof['sea_water_temperature'][0,11],
-                               7.549999, 3)
+                               7.669999, 3)
         self.assertAlmostEqual(prof['sea_water_temperature'][-1,11],
                                8.389999, 3)
         self.assertEqual(prof['z'][-1], b.z[-1])
@@ -322,7 +358,7 @@ class TestInterpolation(unittest.TestCase):
 
     def test_repeated(self):
         """Check that block can be used for interpolation to several sets of positions"""
-        reader = reader_netCDF_CF_generic.Reader(o.test_data_folder() +
+        reader = reader_netCDF_CF_generic.Reader(tdf +
             '14Jan2016_NorKyst_z_3d/NorKyst-800m_ZDEPTHS_his_00_3Dsubset.nc')
 
         # 100 points within 50x50 pixels over sea (corner of domain)
@@ -353,7 +389,7 @@ class TestInterpolation(unittest.TestCase):
 
     def test_interpolation_missing(self):
         """Test interpolation."""
-        reader = reader_ROMS_native.Reader(o.test_data_folder() +
+        reader = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         num_points = 50
         np.random.seed(0)  # To get the same random numbers each time
@@ -385,7 +421,7 @@ class TestInterpolation(unittest.TestCase):
 
     def test_linearNDFast(self):
         """Test interpolation."""
-        reader = reader_ROMS_native.Reader(o.test_data_folder() +
+        reader = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         reader.buffer=3
         num_points = 50
@@ -429,10 +465,10 @@ class TestInterpolation(unittest.TestCase):
                                   profiles=variables,
                                   profiles_depth=[-30, 0])
         self.assertEqual(
-            np.sum(~np.isfinite(env['x_sea_water_velocity'])), 31)
+            np.sum(~np.isfinite(env['x_sea_water_velocity'])), 25)
 
     def test_expand_array(self):
-        reader = reader_ROMS_native.Reader(o.test_data_folder() +
+        reader = reader_ROMS_native.Reader(tdf +
             '2Feb2016_Nordic_sigma_3d/Nordic-4km_SLEVELS_avg_00_subset2Feb2016.nc')
         reader.buffer=1
         num_points = 50

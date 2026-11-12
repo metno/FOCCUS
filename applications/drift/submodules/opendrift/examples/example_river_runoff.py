@@ -20,13 +20,14 @@ histogram_file = 'runoff_histogram.nc'
 #%%
 # First make a simulation with two seedings, marked by *origin_marker*
 o = OceanDrift(loglevel=20)
-o.set_config('drift:horizontal_diffusivity', 300)
+o.set_config('environment:constant:horizontal_diffusivity', 300)
 o.set_config('general:coastline_action', 'previous')
+o.set_config('general:coastline_approximation_precision', None)  # Faster to go back to previous
 t1 = datetime.now()
 t2 = t1 + timedelta(hours=48)
-reader_x = reader_oscillating.Reader('x_sea_water_velocity', period_seconds=3600*24,
+reader_x = reader_oscillating.Reader('x_sea_water_velocity', period=timedelta(hours=24),
                 amplitude=1, zero_time=t1)
-reader_y = reader_oscillating.Reader('y_sea_water_velocity', period_seconds=3600*72,
+reader_y = reader_oscillating.Reader('y_sea_water_velocity', period=timedelta(hours=72),
                 amplitude=.5, zero_time=t2)
 o.add_reader([reader_x, reader_y])
 number = 25000
@@ -43,7 +44,7 @@ o.run(duration=timedelta(hours=48),
 # Opening the output file lazily with Xarray.
 # This will work even if the file is too large to fit in memory, as it
 # will read and process data chuck-by-chunk directly from file using Dask.
-o = opendrift.open_xarray(outfile)
+o = opendrift.open(outfile)
 
 #%%
 # We want to extract timeseries of river water at the coordinates of a hypothetical measuring station
@@ -141,7 +142,7 @@ num = o.get_histogram(pixelsize_m=1500, weights=None, density=False)
 num.name = 'number'
 num.to_netcdf(histogram_file)
 
-mas = o.get_histogram(pixelsize_m=1500, weights=o.ds['age_seconds'], density=False)
+mas = o.get_histogram(pixelsize_m=1500, weights=o.result.age_seconds, density=False)
 mas = mas/3600  # in hours
 mas = mas/num  # per area
 mas.name='mean_age'
@@ -150,7 +151,7 @@ mas = mas.mean(dim='time').sum(dim='origin_marker')  # Mean time of both rivers
 #mas = mas.mean(dim='time').isel(origin_marker=1)  # Mean age of a single river
 mas.name='Mean age of water [hours]'
 
-o.plot(background=mas.where(mas>0), fast=True, show_elements=False)
+o.plot(background=mas.where(mas>0), fast=True, show_elements=False, show_trajectories=False)
 
 
 # Cleaning up

@@ -1,10 +1,10 @@
 import logging
 import numpy as np
-from scipy.ndimage import map_coordinates, grey_dilation
-import logging; logging.captureWarnings(True); logger = logging.getLogger(__name__)
+from scipy.ndimage import map_coordinates, uniform_filter
+import logging; logging.captureWarnings(True)
 from scipy.interpolate import interp1d, LinearNDInterpolator
 
-logger = logging.getLogger('opendrift')  # using common logger
+logger = logging.getLogger(__name__)  # using common logger
 
 def expand_numpy_array(data):
     if isinstance(data, np.ma.MaskedArray):
@@ -13,10 +13,18 @@ def expand_numpy_array(data):
     if not np.isfinite(data).any():
         logger.warning('Only NaNs, returning')
         return
+    # Fill each NaN cell with the MEAN of its valid 3x3 neighbours (was
+    # grey_dilation, a MAX filter -- biased for signed fields like u/v).
     mask = ~np.isfinite(data)
-    data[mask] = np.finfo(np.float64).min
-    data[mask] = grey_dilation(data, size=3)[mask]
-    data[data==np.finfo(np.float64).min] = np.nan
+    valid = np.isfinite(data).astype(np.float64)
+    filled = np.where(mask, 0.0, data).astype(np.float64)
+    num = uniform_filter(filled, size=3, mode='constant', cval=0.0)
+    den = uniform_filter(valid, size=3, mode='constant', cval=0.0)
+    fillable = mask & (den > 1e-12)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        neighbour_mean = num / den
+    data[fillable] = neighbour_mean[fillable].astype(data.dtype)
+    # cells with no valid neighbour stay NaN
 
 
 ###########################
@@ -28,8 +36,9 @@ class Nearest2DInterpolator():
     def __init__(self, xgrid, ygrid, x, y):
         self.x = x
         self.y = y
-        self.xi = (x - xgrid.min())/(xgrid.max()-xgrid.min())*len(xgrid)
-        self.yi = (y - ygrid.min())/(ygrid.max()-ygrid.min())*len(ygrid)
+        # N points span (N-1) cell gaps, not N.
+        self.xi = (x - xgrid.min())/(xgrid.max()-xgrid.min())*(len(xgrid)-1)
+        self.yi = (y - ygrid.min())/(ygrid.max()-ygrid.min())*(len(ygrid)-1)
         self.xi = np.round(self.xi).astype(np.uint32)
         self.yi = np.round(self.yi).astype(np.uint32)
         self.xi[self.xi >= len(xgrid)] = len(xgrid)-1
@@ -59,9 +68,6 @@ class NDImage2DInterpolator():
 
 
 class LinearND2DInterpolator():
-
-
-    logger = logging.getLogger('opendrift')
 
     def __init__(self, xgrid, ygrid, x, y):
         self.block_x, self.block_y = np.meshgrid(xgrid, ygrid)
@@ -105,8 +111,6 @@ class LinearND2DInterpolator():
 
 
 class Linear2DInterpolator():
-
-    logger = logging.getLogger('opendrift')
 
     def __init__(self, xgrid, ygrid, x, y):
         self.x = x

@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from . import *
+from opendrift import test_data_folder as tdf
 from opendrift.readers import reader_netCDF_CF_generic
 from opendrift.readers import reader_timeseries
 from opendrift.readers import reader_failing
@@ -20,7 +21,6 @@ def test_failing_reader():
     o.add_reader(r)
     o.seed_elements(lon=4, lat=60, time=datetime.now())
     o.run(steps=5)
-    print(o.env.discarded_readers)
     assert len(o.env.discarded_readers) == 1
     assert o.steps_calculation == 5
     assert r.number_of_fails == 2
@@ -29,7 +29,7 @@ def test_map_background():
     """Plotting map of reader coverage with background field"""
     o = OceanDrift(loglevel=50)
     r = reader_netCDF_CF_generic.Reader(
-        o.test_data_folder() +
+        tdf +
         '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc')
     fname = 'opendrift_test_reader_map_background.png'
     r.plot(variable='x_sea_water_velocity', filename=fname)
@@ -42,15 +42,12 @@ def test_reader_center(test_data):
         test_data +
         '16Nov2015_NorKyst_z_surface/norkyst800_subset_16Nov2015.nc')
 
-    print(r)
-    print(r.center())
-
-    assert r.center() == (4.717652840595962, 60.60320266262212)
+    assert r.center() == pytest.approx((4.717652840595962, 60.60320266262212))
 
 def test_timeseries_at_position():
     o = OceanDrift()
     reader_arome = reader_netCDF_CF_generic.Reader(
-        o.test_data_folder() +
+        tdf +
         '2Feb2016_Nordic_sigma_3d/AROME_MetCoOp_00_DEF_20160202_subset.nc')
 
     ts = reader_arome.get_timeseries_at_position(
@@ -59,7 +56,6 @@ def test_timeseries_at_position():
     assert len(ts['time']) == 49
     x_wind = ts['x_wind']
     assert len(x_wind) == 49
-    print(x_wind)
     np.testing.assert_almost_equal(x_wind[0], -.256, 2)
     np.testing.assert_almost_equal(x_wind[-1], -4.307, 2)
 
@@ -67,7 +63,7 @@ def test_timeseries_at_position():
 def test_shift_time():
     o = OceanDrift()
     reader_arome = reader_netCDF_CF_generic.Reader(
-        o.test_data_folder() +
+        tdf +
         '2Feb2016_Nordic_sigma_3d/AROME_MetCoOp_00_DEF_20160202_subset.nc')
     new_time = datetime(2021, 5, 26, 8)
     reader_arome.shift_start_time(new_time)
